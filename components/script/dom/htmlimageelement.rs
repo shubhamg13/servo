@@ -24,7 +24,8 @@ use net_traits::image_cache::{
     PendingImageId, UsePlaceholder,
 };
 use net_traits::request::{
-    CorsSettings, Destination, Initiator, Referrer, RequestBuilder, RequestId,
+    CorsSettings, Destination, Initiator, InsecureRequestsPolicy, Referrer, RequestBuilder,
+    RequestId,
 };
 use net_traits::{
     FetchMetadata, FetchResponseListener, FetchResponseMsg, NetworkError, ReferrerPolicy,
@@ -326,6 +327,7 @@ pub(crate) enum FromPictureOrSrcSet {
 
 // https://html.spec.whatwg.org/multipage/#update-the-image-data steps 17-20
 // This function is also used to prefetch an image in `script::dom::servoparser::prefetch`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn image_fetch_request(
     img_url: ServoUrl,
     origin: ImmutableOrigin,
@@ -334,12 +336,19 @@ pub(crate) fn image_fetch_request(
     cors_setting: Option<CorsSettings>,
     referrer_policy: ReferrerPolicy,
     from_picture_or_srcset: FromPictureOrSrcSet,
+    insecure_requests_policy: InsecureRequestsPolicy,
 ) -> RequestBuilder {
-    let mut request =
-        create_a_potential_cors_request(img_url, Destination::Image, cors_setting, None, referrer)
-            .origin(origin)
-            .pipeline_id(Some(pipeline_id))
-            .referrer_policy(referrer_policy);
+    let mut request = create_a_potential_cors_request(
+        img_url,
+        Destination::Image,
+        cors_setting,
+        None,
+        referrer,
+        insecure_requests_policy,
+    )
+    .origin(origin)
+    .pipeline_id(Some(pipeline_id))
+    .referrer_policy(referrer_policy);
     if from_picture_or_srcset == FromPictureOrSrcSet::Yes {
         request = request.initiator(Initiator::ImageSet);
     }
@@ -457,6 +466,7 @@ impl HTMLImageElement {
             } else {
                 FromPictureOrSrcSet::No
             },
+            document.insecure_requests_policy(),
         );
 
         // This is a background load because the load blocker already fulfills the

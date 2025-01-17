@@ -2461,6 +2461,7 @@ impl Node {
                     document.status_code(),
                     Default::default(),
                     false,
+                    Some(document.insecure_requests_policy()),
                     can_gc,
                 );
                 DomRoot::upcast::<Node>(document)
