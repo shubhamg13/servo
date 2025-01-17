@@ -1351,6 +1351,7 @@ where
                     Referrer::NoReferrer,
                     ReferrerPolicy::EmptyString,
                     None,
+                    None,
                 );
                 let ctx_id = BrowsingContextId::from(top_level_browsing_context_id);
                 let pipeline_id = match self.browsing_contexts.get(&ctx_id) {
@@ -2991,6 +2992,7 @@ where
             None,
             Referrer::NoReferrer,
             ReferrerPolicy::EmptyString,
+            None,
             None,
         );
         let sandbox = IFrameSandboxState::IFrameUnsandboxed;

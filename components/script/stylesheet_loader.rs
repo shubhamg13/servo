@@ -9,7 +9,9 @@ use base::id::PipelineId;
 use cssparser::SourceLocation;
 use encoding_rs::UTF_8;
 use mime::{self, Mime};
-use net_traits::request::{CorsSettings, Destination, Referrer, RequestBuilder, RequestId};
+use net_traits::request::{
+    CorsSettings, Destination, InsecureRequestsPolicy, Referrer, RequestBuilder, RequestId,
+};
 use net_traits::{
     FetchMetadata, FetchResponseListener, FilteredMetadata, Metadata, NetworkError, ReferrerPolicy,
     ResourceFetchTiming, ResourceTimingType,
@@ -351,6 +353,7 @@ impl StylesheetLoader<'_> {
             self.elem.global().get_referrer(),
             referrer_policy,
             integrity_metadata,
+            document.insecure_requests_policy(),
         );
         let request = document.prepare_request(request);
 
@@ -360,6 +363,7 @@ impl StylesheetLoader<'_> {
 
 // This function is also used to prefetch a stylesheet in `script::dom::servoparser::prefetch`.
 // https://html.spec.whatwg.org/multipage/#default-fetch-and-process-the-linked-resource
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stylesheet_fetch_request(
     url: ServoUrl,
     cors_setting: Option<CorsSettings>,
@@ -368,12 +372,20 @@ pub(crate) fn stylesheet_fetch_request(
     referrer: Referrer,
     referrer_policy: ReferrerPolicy,
     integrity_metadata: String,
+    insecure_requests_policy: InsecureRequestsPolicy,
 ) -> RequestBuilder {
-    create_a_potential_cors_request(url, Destination::Style, cors_setting, None, referrer)
-        .origin(origin)
-        .pipeline_id(Some(pipeline_id))
-        .referrer_policy(referrer_policy)
-        .integrity_metadata(integrity_metadata)
+    create_a_potential_cors_request(
+        url,
+        Destination::Style,
+        cors_setting,
+        None,
+        referrer,
+        insecure_requests_policy,
+    )
+    .origin(origin)
+    .pipeline_id(Some(pipeline_id))
+    .referrer_policy(referrer_policy)
+    .integrity_metadata(integrity_metadata)
 }
 
 impl StyleStylesheetLoader for StylesheetLoader<'_> {
