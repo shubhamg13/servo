@@ -120,6 +120,7 @@ impl PerformanceObserverMethods<crate::DomTypeHolder> for PerformanceObserver {
         can_gc: CanGc,
         callback: Rc<PerformanceObserverCallback>,
     ) -> Fallible<DomRoot<PerformanceObserver>> {
+        dbg!("Constructing PerformanceObserver");
         Ok(PerformanceObserver::new_with_proto(
             global,
             proto,

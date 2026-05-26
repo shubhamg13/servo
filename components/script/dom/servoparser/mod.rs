@@ -749,32 +749,33 @@ impl ServoParser {
 
     /// <https://html.spec.whatwg.org/multipage/#the-end>
     fn finish(&self, cx: &mut JSContext) {
+        dbg!("Finishing parser");
         assert!(!self.suspended.get());
         assert!(self.last_chunk_received.get());
         assert!(self.script_input.is_empty());
         assert!(self.network_input.is_empty());
         assert!(self.network_decoder.borrow().is_finished());
-
+        dbg!("Finishing parser 2");
         self.stopped.set(true);
 
         // Step 1. If the active speculative HTML parser is not null,
         // then stop the speculative HTML parser and return.
         // TODO
-
+        dbg!("Finishing parser 3");
         // Step 2. Set the insertion point to undefined.
         self.document.set_current_parser(None);
-
+        dbg!("Finishing parser 4");
         // Step 3. Update the current document readiness to "interactive".
         self.document
             .set_ready_state(cx, DocumentReadyState::Interactive);
-
+        dbg!("Finishing parser 4.5");
         // Step 4. Pop all the nodes off the stack of open elements.
         self.tokenizer.end(cx);
-
+        dbg!("Finishing parser 5");
         // Steps 5-11 are in another castle, namely finish_load.
         let url = self.tokenizer.url().clone();
         self.document.finish_load(LoadType::PageSource(url), cx);
-
+        dbg!("Finished parser 6", &self.tokenizer.url());
         // Send the source contents to devtools, if needed.
         if let Some(content_for_devtools) = self
             .content_for_devtools
@@ -1249,6 +1250,7 @@ impl ParserContext {
 
     /// Store a PerformanceNavigationTiming entry in the globalscope's Performance buffer
     fn submit_resource_timing(&mut self) {
+        dbg!("Submitting Navigation timing for document");
         let Some(parser) = self.parser.as_ref() else {
             return;
         };
@@ -1258,7 +1260,10 @@ impl ParserContext {
         }
 
         let document = &parser.document;
-
+        dbg!(
+            "Submitting Navigation timing for document url: {}",
+            &document.url()
+        );
         let performance_entry = PerformanceNavigationTiming::new(
             &document.global(),
             document,
@@ -1560,6 +1565,10 @@ impl FetchResponseListener for ParserContext {
         // TODO: Only update if this is the current document resource.
         if let Some(pushed_index) = self.pushed_entry_index {
             let document = &parser.document;
+            dbg!(
+                "Updating Navigation timing for document at EOF for url: {}",
+                &document.url()
+            );
             let performance_entry =
                 PerformanceNavigationTiming::new(&document.global(), document, CanGc::from_cx(cx));
             document

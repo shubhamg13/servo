@@ -73,7 +73,10 @@ impl PerformanceEntryList {
             })
             .cloned()
             .collect::<Vec<DomRoot<PerformanceEntry>>>();
-
+        dbg!(
+            "Filtering entries by name and type, got {} entries",
+            result.len()
+        );
         // Step 6. Sort results's entries in chronological order with respect to startTime
         result.sort_by(|a, b| {
             a.start_time()
@@ -207,6 +210,7 @@ impl Performance {
         observer: &DOMPerformanceObserver,
         entry_types: Vec<EntryType>,
     ) {
+        dbg!("Adding multiple type observer for types");
         let mut observers = self.observers.borrow_mut();
         match observers.iter().position(|o| *o.observer == *observer) {
             // If the observer is already in the list, we only update the observed
@@ -311,6 +315,11 @@ impl Performance {
             .push(DomRoot::from_ref(entry));
 
         let entry_last_index = self.buffer.borrow_mut().entries.len() - 1;
+        dbg!(
+            "Queued entry of type with name {:?} at index {}",
+            entry.name(),
+            entry_last_index
+        );
 
         // Step 5.
         // If there is already a queued notification task, we just bail out.
@@ -535,6 +544,7 @@ impl Performance {
 impl PerformanceMethods<crate::DomTypeHolder> for Performance {
     /// <https://w3c.github.io/navigation-timing/#dom-performance-timing>
     fn Timing(&self) -> DomRoot<PerformanceNavigationTiming> {
+        dbg!("Getting Performance.timing");
         let entries = self.GetEntriesByType(DOMString::from("navigation"));
         if !entries.is_empty() {
             return DomRoot::from_ref(

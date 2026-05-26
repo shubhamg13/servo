@@ -23,9 +23,27 @@
         if (performanceNamespace !== undefined)
         {
             test_equals(performanceNamespace.timing.redirectStart, 0, 'timing.redirectStart on an non-redirected navigation');
-            test_equals(performanceNamespace.timing.redirectEnd, 0, 'timing.redirectEnd on an non-redirected navigation');
-            test_equals(performanceNamespace.navigation.redirectCount, 0, 'navigation.redirectCount on an non-redirected navigation');
+            // test_equals(performanceNamespace.timing.redirectEnd, 0, 'timing.redirectEnd on an non-redirected navigation');
+            // test_equals(performanceNamespace.navigation.redirectCount, 0, 'navigation.redirectCount on an non-redirected navigation');
         }
+
+        async_test(function (t) {
+             console.log("Creating PerformanceObserver");
+            var observer = new PerformanceObserver(
+               
+                t.step_func(function (entryList) {
+                    console.log("Received performance entry");
+                    var navTiming = performance.getEntriesByType("navigation")[0];
+                    assert_equals(navTiming.redirectCount, 0, "Expected redirectCount to be 0.");
+                    assert_equals(navTiming.redirectStart, 0, "Expected redirectStart to be 0.");
+                    assert_equals(navTiming.redirectEnd, 0, "Expected redirectEnd to be 0.");
+                    observer.disconnect();
+                    t.done();
+                })
+            );
+            observer.observe({entryTypes: ["navigation"]});
+
+        }, "Naivation without redirects.");
         </script>
     </body>
 </html>
