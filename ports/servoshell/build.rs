@@ -5,7 +5,7 @@
 use std::error::Error;
 use std::fs::File;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn git_sha() -> Result<String, String> {
@@ -93,6 +93,29 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/lib/");
     }
 
+    // Copy libLiteRt.{dylib,so,dll} from litert-sys build output into
+    // target/<profile>/lib/ so @executable_path/lib/ rpath resolves at runtime.
+    let lib_name = match target_os.as_str() {
+        "macos" => "libLiteRt.dylib",
+        "windows" => "libLiteRt.dll",
+        _ => "libLiteRt.so",
+    };
+    if let Some(src) = find_litert_lib(lib_name) {
+        if let Some(dst_dir) = Path::new(&out)
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .map(|p| p.join("lib"))
+        {
+            let _ = std::fs::create_dir_all(&dst_dir);
+            let _ = std::fs::copy(&src, dst_dir.join(lib_name));
+            // Embed rpath so the dynamic linker finds the library at runtime
+            if target_os == "linux" {
+                println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/lib");
+            }
+        }
+    }
+
     // On OpenHarmony, libservoshell.so is loaded by ArkTS as a NAPI module.
     // Passing a version script allows us to inform the linker about required
     // symbol visibility (only one), which improves stripping of unused sections.
@@ -115,4 +138,44 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("cargo:rustc-link-arg=-Wl,--version-script={version_script_str}");
     }
     Ok(())
+}
+
+fn find_litert_lib(lib_name: &str) -> Option<PathBuf> {
+    let dep_lib = std::env::var("DEP_LITERT_SYS_LIB_DIR")
+        .ok()
+        .map(|d| Path::new(&d).join(lib_name))
+        .filter(|p| p.exists());
+    if dep_lib.is_some() {
+        return dep_lib;
+    }
+
+    if let Ok(out_dir) = std::env::var("OUT_DIR") {
+        if let Some(build) = Path::new(&out_dir).parent() {
+            if let Some(build_dir) = build.parent() {
+                if let Ok(entries) = std::fs::read_dir(build_dir) {
+                    for entry in entries.flatten() {
+                        let dir = entry.path();
+                        if dir
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with("litert-sys-")
+                        {
+                            if let Ok(output) = std::fs::read_to_string(dir.join("output")) {
+                                for line in output.lines() {
+                                    if let Some(dir) = line.strip_prefix("cargo:lib_dir=") {
+                                        let path = Path::new(dir).join(lib_name);
+                                        if path.exists() {
+                                            return Some(path);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }

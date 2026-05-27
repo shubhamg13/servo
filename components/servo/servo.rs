@@ -900,6 +900,8 @@ impl Servo {
 
         if !opts.multiprocess {
             media_platform::init();
+            #[cfg(feature = "webnn")]
+            webnn::start_webnn_backend();
         }
 
         // Reserving a namespace to create WebViewId.

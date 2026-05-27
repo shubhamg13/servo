@@ -1,0 +1,23 @@
+[package]
+name = "servo-webnn"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[lib]
+name = "webnn"
+path = "lib.rs"
+
+[features]
+default = ["litert"]
+litert = ["dep:litert"]
+
+[dependencies]
+flatbuffers = { workspace = true }
+litert = { workspace = true, optional = true }
+log = { workspace = true }

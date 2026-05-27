@@ -59,6 +59,7 @@ tracing-perfetto = ["tracing", "dep:tracing-perfetto"]
 vello = ["servo/vello"]
 webgl_backtrace = ["servo/webgl_backtrace"]
 webgpu = ["servo/webgpu"]
+webnn = ["servo/webnn"]
 webxr = ["servo/webxr"]
 
 [dependencies]
@@ -72,6 +73,7 @@ hitrace = { workspace = true, optional = true }
 image = { workspace = true }
 keyboard-types = { workspace = true }
 libc = { workspace = true }
+litert = { workspace = true }
 log = { workspace = true }
 mime_guess = { workspace = true }
 raw-window-handle = { workspace = true }
