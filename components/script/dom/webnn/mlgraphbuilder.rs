@@ -258,21 +258,28 @@ impl MLGraphBuilder {
         let stride_w = options.strides.as_ref().map(|s| s[1]).unwrap_or(1);
 
         let (out_h, out_w) = if !auto_pad {
-            let pad_top = options.padding.as_ref().map(|p| p[0]).unwrap_or(0);
-            let pad_bottom = options.padding.as_ref().map(|p| p[1]).unwrap_or(0);
-            let pad_left = options.padding.as_ref().map(|p| p[2]).unwrap_or(0);
-            let pad_right = options.padding.as_ref().map(|p| p[3]).unwrap_or(0);
-            let oh = if window_h > in_shape[2] + pad_top + pad_bottom {
-                1
+            // Explicit padding was given. Match compiler behaviour:
+            // all-zero pads → VALID formula, non-zero pads → SAME formula.
+            let all_pads_zero = (0..4).all(|i| {
+                options.padding.as_ref().map(|p| p[i]).unwrap_or(0) == 0
+            });
+            if all_pads_zero {
+                let oh = if window_h > in_shape[2] {
+                    1
+                } else {
+                    (in_shape[2] - window_h) / stride_h + 1
+                };
+                let ow = if window_w > in_shape[3] {
+                    1
+                } else {
+                    (in_shape[3] - window_w) / stride_w + 1
+                };
+                (oh, ow)
             } else {
-                (in_shape[2] + pad_top + pad_bottom - window_h) / stride_h + 1
-            };
-            let ow = if window_w > in_shape[3] + pad_left + pad_right {
-                1
-            } else {
-                (in_shape[3] + pad_left + pad_right - window_w) / stride_w + 1
-            };
-            (oh, ow)
+                let oh = (in_shape[2] + stride_h - 1) / stride_h;
+                let ow = (in_shape[3] + stride_w - 1) / stride_w;
+                (oh, ow)
+            }
         } else {
             let oh = if window_h > in_shape[2] {
                 1
@@ -1670,13 +1677,43 @@ impl MLGraphBuilderMethods<crate::DomTypeHolder> for MLGraphBuilder {
         let effective_filter_w = (filt_shape[3] - 1) * dilation_w + 1;
         let out_channels = filt_shape[0];
         let (out_h, out_w) = if auto_pad {
-            let oh = (in_shape[2] + stride_h - 1) / stride_h;
-            let ow = (in_shape[3] + stride_w - 1) / stride_w;
+            // No explicit padding — the compiler uses VALID mode, so compute
+            // the VALID output shape: (in - filter) / stride + 1.
+            let oh = if effective_filter_h > in_shape[2] {
+                1
+            } else {
+                (in_shape[2] - effective_filter_h) / stride_h + 1
+            };
+            let ow = if effective_filter_w > in_shape[3] {
+                1
+            } else {
+                (in_shape[3] - effective_filter_w) / stride_w + 1
+            };
             (oh, ow)
         } else {
-            let oh = (in_shape[2] - effective_filter_h) / stride_h + 1;
-            let ow = (in_shape[3] - effective_filter_w) / stride_w + 1;
-            (oh, ow)
+            // Explicit padding was given. The compiler uses SAME mode for
+            // non-zero padding and VALID for all-zero padding. Match that
+            // so the declared output shape agrees with TFLite's output.
+            let all_pads_zero = (0..4).all(|i| {
+                options.padding.as_ref().map(|p| p[i]).unwrap_or(0) == 0
+            });
+            if all_pads_zero {
+                let oh = if effective_filter_h > in_shape[2] {
+                    1
+                } else {
+                    (in_shape[2] - effective_filter_h) / stride_h + 1
+                };
+                let ow = if effective_filter_w > in_shape[3] {
+                    1
+                } else {
+                    (in_shape[3] - effective_filter_w) / stride_w + 1
+                };
+                (oh, ow)
+            } else {
+                let oh = (in_shape[2] + stride_h - 1) / stride_h;
+                let ow = (in_shape[3] + stride_w - 1) / stride_w;
+                (oh, ow)
+            }
         };
         let output_shape = vec![in_shape[0], out_channels, out_h, out_w];
         Ok(make_node_op_with_attrs(
