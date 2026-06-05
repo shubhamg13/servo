@@ -15,9 +15,10 @@ path = "lib.rs"
 
 [features]
 default = ["litert"]
-litert = ["dep:litert"]
+litert = ["dep:litert", "dep:litert-sys"]
 
 [dependencies]
 flatbuffers = { workspace = true }
 litert = { workspace = true, optional = true }
+litert-sys = { workspace = true, optional = true }
 log = { workspace = true }

@@ -592,3 +592,102 @@ fn test_compile_average_pool2d() {
         )],
     );
 }
+
+#[test]
+fn test_run_conv2d() {
+    use webnn::backends::infer;
+
+    webnn::litert::initialize().unwrap();
+
+    // 1x5x5x1 input convolved with 1x3x3x1 filter (all ones) using VALID
+    // padding. The output is 1x3x3x1 of all-9s. This test exercises the
+    // path where XNNPACK pads the conv2d output tensor for SIMD alignment,
+    // which previously failed with "Custom allocation is too small".
+    let mut nodes = vec![
+        make_node("constant", vec![], "f", vec![1, 1, 3, 3], vec![]),
+        make_node("conv2d", vec!["x", "f"], "y", vec![1, 1, 3, 3], vec![]),
+    ];
+
+    // Pre-populate the constant filter with all 1.0s.
+    let filter_bytes: Vec<u8> = (0..9).flat_map(|_| 1.0f32.to_le_bytes()).collect();
+    nodes[0].data = Some(filter_bytes);
+
+    let input_bytes: Vec<u8> = (0..25).flat_map(|_| 1.0f32.to_le_bytes()).collect();
+
+    let result = infer(
+        &nodes,
+        &[("x", input_bytes.as_slice())],
+        &[("x".to_string(), vec![1, 1, 5, 5], DataType::Float32)],
+    )
+    .expect("inference should succeed");
+
+    assert_eq!(result.outputs.len(), 1);
+    let output = &result.outputs[0];
+    assert_eq!(output.len(), 9 * 4, "output should be 9 floats");
+    let values: Vec<f32> = output
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    for v in values {
+        assert!(
+            (v - 9.0).abs() < 1e-4,
+            "expected each output to be 9.0 (sum of 3x3 ones filter), got {}",
+            v
+        );
+    }
+}
+
+#[test]
+fn test_run_max_pool2d() {
+    use webnn::backends::infer;
+
+    webnn::litert::initialize().unwrap();
+
+    // 1x1x4x4 input, maxPool2d with 2x2 window, stride 2, VALID padding.
+    // Input values are [1..16] in NCHW row-major (channel=1, H=4, W=4).
+    // With 2x2 max-pooling and stride 2, output is 2x2:
+    //   (0,0): max(1, 2,  5,  6)  =  6
+    //   (0,1): max(3, 4,  7,  8)  =  8
+    //   (1,0): max(9,10, 13, 14)  = 14
+    //   (1,1): max(11,12,15,16)  = 16
+    let input_f32: Vec<f32> = (1..=16).map(|i| i as f32).collect();
+    let input_bytes: Vec<u8> = input_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    let nodes = vec![make_node(
+        "maxPool2d",
+        vec!["x"],
+        "y",
+        vec![1, 1, 2, 2],
+        vec![
+            ("window_h", 2.0),
+            ("window_w", 2.0),
+            ("stride_h", 2.0),
+            ("stride_w", 2.0),
+        ],
+    )];
+
+    let result = infer(
+        &nodes,
+        &[("x", input_bytes.as_slice())],
+        &[("x".to_string(), vec![1, 1, 4, 4], DataType::Float32)],
+    )
+    .expect("maxPool2d inference should succeed");
+
+    assert_eq!(result.outputs.len(), 1);
+    let output = &result.outputs[0];
+    assert_eq!(output.len(), 4 * 4, "output should be 4 floats");
+    let values: Vec<f32> = output
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let expected = [6.0, 8.0, 14.0, 16.0];
+    for (i, (&got, &exp)) in values.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (got - exp).abs() < 1e-4,
+            "output[{}] expected {}, got {}",
+            i,
+            exp,
+            got
+        );
+    }
+}

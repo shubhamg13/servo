@@ -81,6 +81,8 @@ pub enum CompiledModel {
         compiled: Box<dyn std::any::Any>,
         input_shapes: Vec<(String, Vec<u32>, DataType)>,
         output_shapes: Vec<(String, Vec<u32>, DataType)>,
+        nhwc_inputs: std::collections::HashSet<String>,
+        nhwc_outputs: std::collections::HashSet<String>,
     },
 }
 

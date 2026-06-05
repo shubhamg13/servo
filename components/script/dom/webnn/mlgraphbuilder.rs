@@ -211,6 +211,94 @@ impl MLGraphBuilder {
     pub(crate) fn new(global: &GlobalScope, can_gc: CanGc) -> DomRoot<MLGraphBuilder> {
         reflect_dom_object(Box::new(MLGraphBuilder::new_inherited()), global, can_gc)
     }
+
+    fn make_pool2d(
+        &self,
+        input: &MLOperand,
+        options: &MLPool2dOptions,
+        op: &str,
+    ) -> Result<DomRoot<MLOperand>, Error> {
+        check_same_builder(self, [input], &options.parent.label.0)?;
+        let in_shape = input.shape();
+        let mut attrs = OpAttrs::new();
+
+        let mut auto_pad = true;
+        if let Some(ref p) = options.padding {
+            auto_pad = false;
+            for (i, &v) in p.iter().enumerate() {
+                attrs.insert(format!("pad{}", i), v as f64);
+            }
+        }
+
+        if let Some(ref w) = options.windowDimensions {
+            attrs.insert("window_h".to_string(), w[0] as f64);
+            if w.len() > 1 {
+                attrs.insert("window_w".to_string(), w[1] as f64);
+            }
+        }
+        if let Some(ref s) = options.strides {
+            attrs.insert("stride_h".to_string(), s[0] as f64);
+            if s.len() > 1 {
+                attrs.insert("stride_w".to_string(), s[1] as f64);
+            }
+        }
+
+        let rank = in_shape.len();
+        let window_h = options
+            .windowDimensions
+            .as_ref()
+            .map(|w| w[0])
+            .unwrap_or(if rank >= 4 { in_shape[2] } else { 1 });
+        let window_w = options
+            .windowDimensions
+            .as_ref()
+            .map(|w| w[1])
+            .unwrap_or(if rank >= 4 { in_shape[3] } else { 1 });
+        let stride_h = options.strides.as_ref().map(|s| s[0]).unwrap_or(1);
+        let stride_w = options.strides.as_ref().map(|s| s[1]).unwrap_or(1);
+
+        let (out_h, out_w) = if !auto_pad {
+            let pad_top = options.padding.as_ref().map(|p| p[0]).unwrap_or(0);
+            let pad_bottom = options.padding.as_ref().map(|p| p[1]).unwrap_or(0);
+            let pad_left = options.padding.as_ref().map(|p| p[2]).unwrap_or(0);
+            let pad_right = options.padding.as_ref().map(|p| p[3]).unwrap_or(0);
+            let oh = if window_h > in_shape[2] + pad_top + pad_bottom {
+                1
+            } else {
+                (in_shape[2] + pad_top + pad_bottom - window_h) / stride_h + 1
+            };
+            let ow = if window_w > in_shape[3] + pad_left + pad_right {
+                1
+            } else {
+                (in_shape[3] + pad_left + pad_right - window_w) / stride_w + 1
+            };
+            (oh, ow)
+        } else {
+            let oh = if window_h > in_shape[2] {
+                1
+            } else {
+                (in_shape[2] - window_h) / stride_h + 1
+            };
+            let ow = if window_w > in_shape[3] {
+                1
+            } else {
+                (in_shape[3] - window_w) / stride_w + 1
+            };
+            (oh, ow)
+        };
+
+        let output_shape = vec![in_shape[0], in_shape[1], out_h, out_w];
+        Ok(make_node_op_with_attrs(
+            self,
+            &self.global(),
+            op,
+            &[input],
+            input.data_type(),
+            output_shape,
+            attrs,
+            None,
+        ))
+    }
 }
 
 impl MLGraphBuilderMethods<crate::DomTypeHolder> for MLGraphBuilder {
@@ -1523,15 +1611,7 @@ impl MLGraphBuilderMethods<crate::DomTypeHolder> for MLGraphBuilder {
         input: &MLOperand,
         options: &MLPool2dOptions,
     ) -> Result<DomRoot<MLOperand>, Error> {
-        check_same_builder(self, [input], &options.parent.label.0)?;
-        Ok(make_node_op(
-            self,
-            &self.global(),
-            "averagePool2d",
-            &[input],
-            input.data_type(),
-            input.shape().to_vec(),
-        ))
+        self.make_pool2d(input, options, "averagePool2d")
     }
 
     fn MaxPool2d(
@@ -1539,15 +1619,7 @@ impl MLGraphBuilderMethods<crate::DomTypeHolder> for MLGraphBuilder {
         input: &MLOperand,
         options: &MLPool2dOptions,
     ) -> Result<DomRoot<MLOperand>, Error> {
-        check_same_builder(self, [input], &options.parent.label.0)?;
-        Ok(make_node_op(
-            self,
-            &self.global(),
-            "maxPool2d",
-            &[input],
-            input.data_type(),
-            input.shape().to_vec(),
-        ))
+        self.make_pool2d(input, options, "maxPool2d")
     }
 
     fn L2Pool2d(
@@ -1555,15 +1627,7 @@ impl MLGraphBuilderMethods<crate::DomTypeHolder> for MLGraphBuilder {
         input: &MLOperand,
         options: &MLPool2dOptions,
     ) -> Result<DomRoot<MLOperand>, Error> {
-        check_same_builder(self, [input], &options.parent.label.0)?;
-        Ok(make_node_op(
-            self,
-            &self.global(),
-            "l2Pool2d",
-            &[input],
-            input.data_type(),
-            input.shape().to_vec(),
-        ))
+        self.make_pool2d(input, options, "l2Pool2d")
     }
 
     // ── Convolution ──
@@ -1576,7 +1640,9 @@ impl MLGraphBuilderMethods<crate::DomTypeHolder> for MLGraphBuilder {
     ) -> Result<DomRoot<MLOperand>, Error> {
         check_same_builder(self, [input, filter], &options.parent.label.0)?;
         let mut attrs = OpAttrs::new();
+        let mut auto_pad = true;
         if let Some(ref p) = options.padding {
+            auto_pad = false;
             for (i, &v) in p.iter().enumerate() {
                 attrs.insert(format!("pad{}", i), v as f64);
             }
@@ -1594,13 +1660,32 @@ impl MLGraphBuilderMethods<crate::DomTypeHolder> for MLGraphBuilder {
             }
         }
         attrs.insert("groups".to_string(), options.groups as f64);
+        let in_shape = input.shape();
+        let filt_shape = filter.shape();
+        let stride_h = options.strides.as_ref().map(|s| s[0] as u32).unwrap_or(1);
+        let stride_w = options.strides.as_ref().map(|s| s[1] as u32).unwrap_or(1);
+        let dilation_h = options.dilations.as_ref().map(|d| d[0] as u32).unwrap_or(1);
+        let dilation_w = options.dilations.as_ref().map(|d| d[1] as u32).unwrap_or(1);
+        let effective_filter_h = (filt_shape[2] - 1) * dilation_h + 1;
+        let effective_filter_w = (filt_shape[3] - 1) * dilation_w + 1;
+        let out_channels = filt_shape[0];
+        let (out_h, out_w) = if auto_pad {
+            let oh = (in_shape[2] + stride_h - 1) / stride_h;
+            let ow = (in_shape[3] + stride_w - 1) / stride_w;
+            (oh, ow)
+        } else {
+            let oh = (in_shape[2] - effective_filter_h) / stride_h + 1;
+            let ow = (in_shape[3] - effective_filter_w) / stride_w + 1;
+            (oh, ow)
+        };
+        let output_shape = vec![in_shape[0], out_channels, out_h, out_w];
         Ok(make_node_op_with_attrs(
             self,
             &self.global(),
             "conv2d",
             &[input, filter],
             input.data_type(),
-            input.shape().to_vec(),
+            output_shape,
             attrs,
             None,
         ))
@@ -1911,7 +1996,7 @@ impl MLGraphBuilderMethods<crate::DomTypeHolder> for MLGraphBuilder {
             &self.global(),
             "dequantizeLinear",
             &[input, scale, zero_point],
-            input.data_type(),
+            MLOperandDataType::Float32,
             input.shape().to_vec(),
         ))
     }

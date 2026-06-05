@@ -239,12 +239,12 @@ fn build_conv2d_options(
     activation: u8,
 ) -> WIPOffset<TableFinishedWIPOffset> {
     let t = fbb.start_table();
-    fbb.push_slot::<u8>(4, padding, tfl::padding::SAME);
-    fbb.push_slot::<i32>(6, stride_w, 1);
-    fbb.push_slot::<i32>(8, stride_h, 1);
-    fbb.push_slot::<u8>(10, activation, tfl::activation::NONE);
-    fbb.push_slot::<i32>(12, dilation_w, 1);
-    fbb.push_slot::<i32>(14, dilation_h, 1);
+    fbb.push_slot_always::<u8>(4, padding);
+    fbb.push_slot_always::<i32>(6, stride_w);
+    fbb.push_slot_always::<i32>(8, stride_h);
+    fbb.push_slot_always::<u8>(10, activation);
+    fbb.push_slot_always::<i32>(12, dilation_w);
+    fbb.push_slot_always::<i32>(14, dilation_h);
     fbb.end_table(t)
 }
 
@@ -522,7 +522,6 @@ fn webnn_op_to_tflite(op: &str) -> Option<i32> {
         "concat" => Some(tfl::op::CONCATENATION),
         "conv2d" | "conv_2d" => Some(tfl::op::CONV_2D),
         "convTranspose2d" | "conv_transpose2d" => Some(tfl::op::TRANSPOSE_CONV),
-        "dequantizeLinear" | "dequantize_linear" => Some(tfl::op::DEQUANTIZE),
         "gemm" => Some(tfl::op::BATCH_MATMUL),
         "matmul" => Some(tfl::op::BATCH_MATMUL),
         "averagePool2d" | "average_pool_2d" => Some(tfl::op::AVERAGE_POOL_2D),
@@ -865,23 +864,32 @@ impl GraphCompiler {
 ///
 /// Returns an owned byte buffer suitable for `litert::Model::from_bytes()`.
 pub fn compile(nodes: &[GraphNode]) -> Result<Vec<u8>, String> {
-    compile_with_input_infos(nodes, &[])
+    let result = compile_with_input_infos(nodes, &[])?;
+    Ok(result.flatbuf)
 }
 
 /// Compile a WebNN graph into a TFLite flatbuffer model.
 ///
 /// `input_infos` provides authoritative (name, shape, dtype) for graph input tensors,
 /// overriding the node output shape that `GraphNode.desc.shape` incorrectly carries.
+pub struct CompileResult {
+    pub flatbuf: Vec<u8>,
+    pub nhwc_inputs: Vec<String>,
+    pub nhwc_outputs: Vec<String>,
+}
+
 pub fn compile_with_input_infos(
     nodes: &[GraphNode],
     input_infos: &[(String, Vec<u32>, DataType)],
-) -> Result<Vec<u8>, String> {
+) -> Result<CompileResult, String> {
     if nodes.is_empty() {
         return Err("Cannot compile empty graph".to_string());
     }
 
     let mut fbb = FlatBufferBuilder::new();
     let mut g = GraphCompiler::new();
+    let mut nhwc_inputs: Vec<String> = Vec::new();
+    let mut nhwc_outputs: Vec<String> = Vec::new();
 
     // Pre-scan constant nodes to collect buffer data.
     let mut constant_data: std::collections::HashMap<&str, &[u8]> =
@@ -932,6 +940,67 @@ pub fn compile_with_input_infos(
         let shape = node.desc.shape.clone();
 
         match node.op.as_str() {
+            "dequantizeLinear" | "dequantize_linear" => {
+                if node.inputs.len() < 3 {
+                    return Err("dequantizeLinear needs input, scale, zeroPoint".to_string());
+                }
+                let input_idx = ensure_input(&mut g, &node.inputs[0], dtype, &shape);
+                let scale_idx = ensure_input(
+                    &mut g,
+                    &node.inputs[1],
+                    webnn_type_to_tflite(DataType::Float32),
+                    &shape,
+                );
+                let zp_idx = ensure_input(&mut g, &node.inputs[2], dtype, &shape);
+                let (cast_input, _) =
+                    g.reserve_temporary(webnn_type_to_tflite(DataType::Float32), shape.clone());
+                let cast_in_opt =
+                    build_cast_options(&mut fbb, dtype, webnn_type_to_tflite(DataType::Float32));
+                g.emit(
+                    &mut fbb,
+                    tfl::op::CAST,
+                    vec![input_idx],
+                    vec![cast_input],
+                    tfl::builtin_options::CAST,
+                    Some(cast_in_opt),
+                );
+                let (cast_zp, _) =
+                    g.reserve_temporary(webnn_type_to_tflite(DataType::Float32), shape.clone());
+                let cast_zp_opt =
+                    build_cast_options(&mut fbb, dtype, webnn_type_to_tflite(DataType::Float32));
+                g.emit(
+                    &mut fbb,
+                    tfl::op::CAST,
+                    vec![zp_idx],
+                    vec![cast_zp],
+                    tfl::builtin_options::CAST,
+                    Some(cast_zp_opt),
+                );
+                let (sub_out, _) =
+                    g.reserve_temporary(webnn_type_to_tflite(DataType::Float32), shape.clone());
+                g.emit(
+                    &mut fbb,
+                    tfl::op::SUB,
+                    vec![cast_input, cast_zp],
+                    vec![sub_out],
+                    0,
+                    None,
+                );
+                let out_idx = g.ensure_tensor(
+                    &node.output,
+                    webnn_type_to_tflite(DataType::Float32),
+                    &shape,
+                );
+                g.emit(
+                    &mut fbb,
+                    tfl::op::MUL,
+                    vec![sub_out, scale_idx],
+                    vec![out_idx],
+                    0,
+                    None,
+                );
+                continue;
+            },
             "batchNormalization" | "batch_normalization" => {
                 if node.inputs.len() < 3 {
                     return Err("batchNormalization needs at least 3 inputs".to_string());
@@ -1158,7 +1227,9 @@ pub fn compile_with_input_infos(
                 "linear" |
                 "where" |
                 "layerNormalization" |
-                "layer_normalization"
+                "layer_normalization" |
+                "dequantizeLinear" |
+                "dequantize_linear"
         ) {
             continue;
         }
@@ -1174,16 +1245,59 @@ pub fn compile_with_input_infos(
                 if input_indices.len() < 2 {
                     return Err("conv2d needs input and filter".to_string());
                 }
-                let pad = tfl::padding::SAME;
+                let in_name = &node.inputs[0];
+                let filt_name = &node.inputs[1];
+                let in_shape = g.tensor_shape.get(in_name).cloned().unwrap_or_default();
+                let filt_shape = g.tensor_shape.get(filt_name).cloned().unwrap_or_default();
+                let out_shape_nchw = &node.desc.shape;
+                let rank = in_shape.len() as i32;
+                let out_channels = filt_shape[0] as usize;
+                let out_dtype = webnn_type_to_tflite(node.desc.data_type);
+                let all_pads_zero =
+                    (0..4).all(|i| attrs.get(&format!("pad{}", i)).copied().unwrap_or(0.0) == 0.0);
+                let pad = if all_pads_zero {
+                    tfl::padding::VALID
+                } else {
+                    // TFLite Conv2D only supports VALID or SAME padding modes,
+                    // not per-side padding values. When WebNN specifies explicit
+                    // non-zero padding, we use SAME padding which approximately
+                    // matches. A more complete fix would insert explicit Pad ops
+                    // before the Conv2D operator.
+                    tfl::padding::SAME
+                };
                 let s_h = attrs.get("stride_h").copied().unwrap_or(1.0) as i32;
                 let s_w = attrs.get("stride_w").copied().unwrap_or(1.0) as i32;
                 let d_h = attrs.get("dilation_h").copied().unwrap_or(1.0) as i32;
                 let d_w = attrs.get("dilation_w").copied().unwrap_or(1.0) as i32;
+                if rank >= 4 {
+                    let nhwc_in_shape: Vec<u32> =
+                        vec![in_shape[0], in_shape[2], in_shape[3], in_shape[1]];
+                    let nhwc_filt_shape: Vec<u32> =
+                        vec![filt_shape[0], filt_shape[2], filt_shape[3], filt_shape[1]];
+                    let nhwc_out_shape: Vec<u32> = vec![
+                        out_shape_nchw[0],
+                        out_shape_nchw[2],
+                        out_shape_nchw[3],
+                        out_shape_nchw[1],
+                    ];
+                    g.tensor_shape.insert(in_name.clone(), nhwc_in_shape);
+                    g.tensor_shape.insert(filt_name.clone(), nhwc_filt_shape);
+                    g.tensor_shape.insert(node.output.clone(), nhwc_out_shape);
+                    nhwc_inputs.push(in_name.clone());
+                    nhwc_inputs.push(filt_name.clone());
+                    nhwc_outputs.push(node.output.clone());
+                }
+                let (bias_idx, bias_name) =
+                    g.reserve_temporary(out_dtype, vec![out_channels as u32]);
+                let bias_bytes: Vec<u8> = vec![0u8; out_channels * 4];
+                extra_constant_data.insert(bias_name, bias_bytes);
                 let opt = build_conv2d_options(&mut fbb, pad as u8, s_w, s_h, d_w, d_h, 0);
+                let mut conv_inputs = input_indices.clone();
+                conv_inputs.push(bias_idx);
                 g.emit(
                     &mut fbb,
                     tfl_code,
-                    input_indices.clone(),
+                    conv_inputs,
                     vec![output_idx],
                     tfl::builtin_options::CONV_2D,
                     Some(opt),
@@ -1204,17 +1318,36 @@ pub fn compile_with_input_infos(
                 );
             },
             tfl::op::AVERAGE_POOL_2D | tfl::op::MAX_POOL_2D | tfl::op::L2_POOL_2D => {
-                let input_shape = g
-                    .tensor_shape
-                    .get(&node.inputs[0])
-                    .cloned()
-                    .unwrap_or_default();
-                let (fh, fw) = if input_shape.len() >= 4 {
-                    (input_shape[1] as i32, input_shape[2] as i32)
+                let in_name = &node.inputs[0];
+                let in_shape = g.tensor_shape.get(in_name).cloned().unwrap_or_default();
+                let rank = in_shape.len() as i32;
+                if rank >= 4 {
+                    let nhwc_in_shape: Vec<u32> =
+                        vec![in_shape[0], in_shape[2], in_shape[3], in_shape[1]];
+                    let nhwc_out_shape: Vec<u32> = vec![
+                        node.desc.shape[0],
+                        node.desc.shape[2],
+                        node.desc.shape[3],
+                        node.desc.shape[1],
+                    ];
+                    g.tensor_shape.insert(in_name.clone(), nhwc_in_shape);
+                    g.tensor_shape.insert(node.output.clone(), nhwc_out_shape);
+                    nhwc_inputs.push(in_name.clone());
+                    nhwc_outputs.push(node.output.clone());
+                }
+                let w_h = attrs.get("window_h").copied().unwrap_or(in_shape[2] as f64) as i32;
+                let w_w = attrs.get("window_w").copied().unwrap_or(in_shape[3] as f64) as i32;
+                let s_h = attrs.get("stride_h").copied().unwrap_or(1.0) as i32;
+                let s_w = attrs.get("stride_w").copied().unwrap_or(1.0) as i32;
+                let all_pads_zero =
+                    (0..4).all(|i| attrs.get(&format!("pad{}", i)).copied().unwrap_or(0.0) == 0.0);
+                let pad = if all_pads_zero {
+                    tfl::padding::VALID
                 } else {
-                    (1, 1)
+                    tfl::padding::SAME
                 };
-                let opt = build_pool2d_options(&mut fbb, tfl::padding::SAME, fh, fw, fh, fw, 0);
+                // TFLite Pool2DOptions uses filter_[w/h], not window.
+                let opt = build_pool2d_options(&mut fbb, pad, s_w, s_h, w_w, w_h, 0);
                 g.emit(
                     &mut fbb,
                     tfl_code,
@@ -1724,16 +1857,6 @@ pub fn compile_with_input_infos(
                 let trans_inputs = vec![input_indices[0], perm_idx];
                 g.emit(&mut fbb, tfl_code, trans_inputs, vec![output_idx], 0, None);
             },
-            tfl::op::DEQUANTIZE => {
-                g.emit(
-                    &mut fbb,
-                    tfl_code,
-                    input_indices.clone(),
-                    vec![output_idx],
-                    tfl::builtin_options::DEQUANTIZE,
-                    None,
-                );
-            },
             tfl::op::QUANTIZE => {
                 g.emit(
                     &mut fbb,
@@ -1896,5 +2019,9 @@ pub fn compile_with_input_infos(
         log::error!("Failed to write diagnostic file: {}", e);
     }
 
-    Ok(result)
+    Ok(CompileResult {
+        flatbuf: result,
+        nhwc_inputs,
+        nhwc_outputs,
+    })
 }

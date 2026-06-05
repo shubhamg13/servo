@@ -9377,6 +9377,7 @@ version = "0.3.0"
 dependencies = [
  "flatbuffers",
  "litert",
+ "litert-sys",
  "log",
 ]
 
