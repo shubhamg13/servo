@@ -46,6 +46,7 @@ pub(crate) struct MLGraph {
     nodes: DomRefCell<Vec<ComputeNode>>,
     input_names: DomRefCell<Vec<String>>,
     output_names: DomRefCell<Vec<String>>,
+    output_internal_names: DomRefCell<Vec<String>>,
     input_operand_info: DomRefCell<HashMap<String, InputOperandInfo>>,
 }
 
@@ -56,6 +57,7 @@ impl MLGraph {
             nodes: DomRefCell::new(Vec::new()),
             input_names: DomRefCell::new(Vec::new()),
             output_names: DomRefCell::new(Vec::new()),
+            output_internal_names: DomRefCell::new(Vec::new()),
             input_operand_info: DomRefCell::new(HashMap::new()),
         }
     }
@@ -71,6 +73,15 @@ impl MLGraph {
     }
     pub(crate) fn set_output_names(&self, names: Vec<String>) {
         *self.output_names.borrow_mut() = names;
+    }
+    pub(crate) fn output_names(&self) -> std::cell::Ref<'_, Vec<String>> {
+        self.output_names.borrow()
+    }
+    pub(crate) fn set_output_internal_names(&self, names: Vec<String>) {
+        *self.output_internal_names.borrow_mut() = names;
+    }
+    pub(crate) fn output_internal_names(&self) -> std::cell::Ref<'_, Vec<String>> {
+        self.output_internal_names.borrow()
     }
     pub(crate) fn set_input_operand_info(&self, info: HashMap<String, InputOperandInfo>) {
         *self.input_operand_info.borrow_mut() = info;

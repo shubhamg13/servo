@@ -618,6 +618,7 @@ fn test_run_conv2d() {
         &nodes,
         &[("x", input_bytes.as_slice())],
         &[("x".to_string(), vec![1, 1, 5, 5], DataType::Float32)],
+        &["y".to_string()],
     )
     .expect("inference should succeed");
 
@@ -670,6 +671,7 @@ fn test_run_max_pool2d() {
         &nodes,
         &[("x", input_bytes.as_slice())],
         &[("x".to_string(), vec![1, 1, 4, 4], DataType::Float32)],
+        &["y".to_string()],
     )
     .expect("maxPool2d inference should succeed");
 

@@ -102,7 +102,7 @@ fn extract_output_region(
 
     let total = n * h * w * c;
     let mut out = vec![0u8; total * elem_size];
-    for ni in 0..n.min(1) {
+    for ni in 0..n {
         for hi in 0..h.min(ah) {
             for wi in 0..w.min(aw) {
                 for ci in 0..c.min(ac) {
@@ -282,8 +282,9 @@ impl Backend for LiteRtBackend {
         &self,
         nodes: &[GraphNode],
         input_infos: &[(String, Vec<u32>, DataType)],
+        output_names: &[String],
     ) -> Result<WebNNModel, String> {
-        let compile_result = compiler::compile_with_input_infos(nodes, input_infos)?;
+        let compile_result = compiler::compile_with_input_infos(nodes, input_infos, output_names)?;
         let flatbuf = compile_result.flatbuf;
         let nhwc_inputs: HashSet<String> = compile_result.nhwc_inputs.into_iter().collect();
         let nhwc_outputs: HashSet<String> = compile_result.nhwc_outputs.into_iter().collect();
@@ -301,9 +302,11 @@ impl Backend for LiteRtBackend {
             })
             .collect();
 
+        let output_set: std::collections::HashSet<&str> =
+            output_names.iter().map(|s| s.as_str()).collect();
         let output_shapes: Vec<(String, Vec<u32>, DataType)> = nodes
             .iter()
-            .filter(|n| n.op != "constant")
+            .filter(|n| output_set.contains(n.output.as_str()))
             .map(|n| {
                 let shape = if nhwc_outputs.contains(&n.output) && n.desc.shape.len() >= 4 {
                     vec![

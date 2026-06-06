@@ -101,6 +101,7 @@ pub trait Backend: Send {
         &self,
         nodes: &[GraphNode],
         input_infos: &[(String, Vec<u32>, DataType)],
+        output_names: &[String],
     ) -> Result<CompiledModel, String>;
     fn run(&self, model: &CompiledModel, inputs: &[(&str, &[u8])]) -> Result<RunResult, String>;
 }

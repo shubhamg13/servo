@@ -260,9 +260,8 @@ impl MLGraphBuilder {
         let (out_h, out_w) = if !auto_pad {
             // Explicit padding was given. Match compiler behaviour:
             // all-zero pads → VALID formula, non-zero pads → SAME formula.
-            let all_pads_zero = (0..4).all(|i| {
-                options.padding.as_ref().map(|p| p[i]).unwrap_or(0) == 0
-            });
+            let all_pads_zero =
+                (0..4).all(|i| options.padding.as_ref().map(|p| p[i]).unwrap_or(0) == 0);
             if all_pads_zero {
                 let oh = if window_h > in_shape[2] {
                     1
@@ -392,6 +391,8 @@ impl MLGraphBuilderMethods<crate::DomTypeHolder> for MLGraphBuilder {
             .collect();
 
         let output_names: Vec<String> = outputs.iter().map(|(k, _)| k.0.clone()).collect();
+        let output_internal_names: Vec<String> =
+            outputs.iter().map(|(_, v)| v.name().to_string()).collect();
 
         let input_operand_info: HashMap<String, InputOperandInfo> = named
             .iter()
@@ -410,6 +411,7 @@ impl MLGraphBuilderMethods<crate::DomTypeHolder> for MLGraphBuilder {
         graph.set_nodes(nodes);
         graph.set_input_names(input_names);
         graph.set_output_names(output_names);
+        graph.set_output_internal_names(output_internal_names);
         graph.set_input_operand_info(input_operand_info);
 
         let promise = Promise::new_in_current_realm(comp, can_gc);
@@ -1250,14 +1252,18 @@ impl MLGraphBuilderMethods<crate::DomTypeHolder> for MLGraphBuilder {
             total += s[axis as usize];
         }
         out_shape[axis as usize] = total;
+        let mut attrs = OpAttrs::new();
+        attrs.insert("axis".to_string(), axis as f64);
         let refs: Vec<&MLOperand> = inputs.iter().map(|op| &**op).collect();
-        Ok(make_node_op(
+        Ok(make_node_op_with_attrs(
             self,
             &self.global(),
             "concat",
             &refs,
             data_type,
             out_shape,
+            attrs,
+            None,
         ))
     }
 
@@ -1694,9 +1700,8 @@ impl MLGraphBuilderMethods<crate::DomTypeHolder> for MLGraphBuilder {
             // Explicit padding was given. The compiler uses SAME mode for
             // non-zero padding and VALID for all-zero padding. Match that
             // so the declared output shape agrees with TFLite's output.
-            let all_pads_zero = (0..4).all(|i| {
-                options.padding.as_ref().map(|p| p[i]).unwrap_or(0) == 0
-            });
+            let all_pads_zero =
+                (0..4).all(|i| options.padding.as_ref().map(|p| p[i]).unwrap_or(0) == 0);
             if all_pads_zero {
                 let oh = if effective_filter_h > in_shape[2] {
                     1
@@ -1716,11 +1721,15 @@ impl MLGraphBuilderMethods<crate::DomTypeHolder> for MLGraphBuilder {
             }
         };
         let output_shape = vec![in_shape[0], out_channels, out_h, out_w];
+        let mut inputs: Vec<&MLOperand> = vec![input, filter];
+        if let Some(ref bias_op) = options.bias {
+            inputs.push(&**bias_op);
+        }
         Ok(make_node_op_with_attrs(
             self,
             &self.global(),
             "conv2d",
-            &[input, filter],
+            &inputs,
             input.data_type(),
             output_shape,
             attrs,

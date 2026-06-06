@@ -140,11 +140,30 @@ impl MLContextMethods<crate::DomTypeHolder> for MLContext {
                 .map(|(n, d)| (n.as_str(), d.as_slice()))
                 .collect();
 
-            if let Ok(result) = run_inference(&webnn_nodes, &input_slices, &input_infos) {
-                let mut out_iter = result.outputs.into_iter();
+            let output_names = graph.output_names();
+            let output_internal_names = graph.output_internal_names();
+            let user_to_internal: std::collections::HashMap<String, String> = output_names
+                .iter()
+                .zip(output_internal_names.iter())
+                .map(|(u, i)| (u.clone(), i.clone()))
+                .collect();
+            let internal_names: Vec<String> = outputs
+                .iter()
+                .filter_map(|(user_key, _)| user_to_internal.get(user_key.0.as_str()).cloned())
+                .collect();
+            if let Ok(result) =
+                run_inference(&webnn_nodes, &input_slices, &input_infos, &internal_names)
+            {
+                let mut out_map: std::collections::HashMap<String, Vec<u8>> =
+                    std::collections::HashMap::new();
+                for (name, data) in internal_names.iter().zip(result.outputs.into_iter()) {
+                    out_map.insert(name.clone(), data);
+                }
                 for (_name, out_tensor) in outputs.iter() {
-                    if let Some(data) = out_iter.next() {
-                        out_tensor.write_data(&data);
+                    if let Some(internal_name) = user_to_internal.get(_name.0.as_str()) {
+                        if let Some(data) = out_map.remove(internal_name) {
+                            out_tensor.write_data(&data);
+                        }
                     }
                 }
                 return;

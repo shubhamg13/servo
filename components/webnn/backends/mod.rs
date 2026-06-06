@@ -16,11 +16,12 @@ pub fn infer(
     nodes: &[GraphNode],
     inputs: &[(&str, &[u8])],
     input_infos: &[(String, Vec<u32>, DataType)],
+    output_names: &[String],
 ) -> Result<RunResult, String> {
     let backend = litert::LiteRtBackend;
     log::error!("WebNN using backend: {}", backend.name());
     let model = backend
-        .compile_with_input_infos(nodes, input_infos)
+        .compile_with_input_infos(nodes, input_infos, output_names)
         .map_err(|e| {
             log::error!("WebNN compile FAILED: {}", e);
             e
@@ -38,6 +39,7 @@ pub fn infer(
     _nodes: &[GraphNode],
     _inputs: &[(&str, &[u8])],
     _input_infos: &[(String, Vec<u32>, DataType)],
+    _output_names: &[String],
 ) -> Result<RunResult, String> {
     Err("WebNN backend not available (enable the litert feature)".to_string())
 }

@@ -109,6 +109,7 @@ mod tfl {
     pub mod builtin_options {
         pub const NONE: u8 = 0;
         pub const CONV_2D: u8 = 1;
+        pub const DEPTHWISE_CONV_2D: u8 = 2;
         pub const POOL_2D: u8 = 5;
         pub const FULLY_CONNECTED: u8 = 8;
         pub const SOFTMAX: u8 = 9;
@@ -248,6 +249,27 @@ fn build_conv2d_options(
     fbb.end_table(t)
 }
 
+fn build_depthwise_conv2d_options(
+    fbb: &mut FlatBufferBuilder,
+    padding: u8,
+    stride_w: i32,
+    stride_h: i32,
+    dilation_w: i32,
+    dilation_h: i32,
+    activation: u8,
+    depth_multiplier: i32,
+) -> WIPOffset<TableFinishedWIPOffset> {
+    let t = fbb.start_table();
+    fbb.push_slot_always::<u8>(4, padding);
+    fbb.push_slot_always::<i32>(6, stride_w);
+    fbb.push_slot_always::<i32>(8, stride_h);
+    fbb.push_slot_always::<i32>(10, depth_multiplier);
+    fbb.push_slot_always::<u8>(12, activation);
+    fbb.push_slot_always::<i32>(14, dilation_w);
+    fbb.push_slot_always::<i32>(16, dilation_h);
+    fbb.end_table(t)
+}
+
 fn build_pool2d_options(
     fbb: &mut FlatBufferBuilder,
     padding: u8,
@@ -258,11 +280,11 @@ fn build_pool2d_options(
     activation: u8,
 ) -> WIPOffset<TableFinishedWIPOffset> {
     let t = fbb.start_table();
-    fbb.push_slot::<u8>(4, padding, tfl::padding::SAME);
-    fbb.push_slot::<i32>(6, stride_w, 1);
-    fbb.push_slot::<i32>(8, stride_h, 1);
-    fbb.push_slot::<i32>(10, filter_w, 1);
-    fbb.push_slot::<i32>(12, filter_h, 1);
+    fbb.push_slot_always::<u8>(4, padding);
+    fbb.push_slot_always::<i32>(6, stride_w);
+    fbb.push_slot_always::<i32>(8, stride_h);
+    fbb.push_slot_always::<i32>(10, filter_w);
+    fbb.push_slot_always::<i32>(12, filter_h);
     fbb.push_slot::<u8>(14, activation, tfl::activation::NONE);
     fbb.end_table(t)
 }
@@ -542,7 +564,6 @@ fn webnn_op_to_tflite(op: &str) -> Option<i32> {
         "floor" => Some(tfl::op::FLOOR),
         "pad" => Some(tfl::op::PAD),
         "prelu" => Some(tfl::op::PRELU),
-        "clamp" => Some(tfl::op::RELU6),
         "resample2d" | "resample_2d" => Some(tfl::op::RESIZE_BILINEAR),
         "slice" => Some(tfl::op::SLICE),
         "split" => Some(tfl::op::SPLIT_V),
@@ -864,7 +885,7 @@ impl GraphCompiler {
 ///
 /// Returns an owned byte buffer suitable for `litert::Model::from_bytes()`.
 pub fn compile(nodes: &[GraphNode]) -> Result<Vec<u8>, String> {
-    let result = compile_with_input_infos(nodes, &[])?;
+    let result = compile_with_input_infos(nodes, &[], &[])?;
     Ok(result.flatbuf)
 }
 
@@ -881,6 +902,7 @@ pub struct CompileResult {
 pub fn compile_with_input_infos(
     nodes: &[GraphNode],
     input_infos: &[(String, Vec<u32>, DataType)],
+    output_names: &[String],
 ) -> Result<CompileResult, String> {
     if nodes.is_empty() {
         return Err("Cannot compile empty graph".to_string());
@@ -1055,6 +1077,66 @@ pub fn compile_with_input_infos(
                 );
                 continue;
             },
+            "clamp" => {
+                let min_val = node.attrs.get("minValue").copied();
+                let max_val = node.attrs.get("maxValue").copied();
+                let input_idx = ensure_input(&mut g, &node.inputs[0], dtype, &shape);
+                if min_val.is_none() && max_val.is_none() {
+                    let out_idx = g.ensure_tensor(&node.output, dtype, &shape);
+                    g.emit(
+                        &mut fbb,
+                        tfl::op::RELU6,
+                        vec![input_idx],
+                        vec![out_idx],
+                        0,
+                        None,
+                    );
+                    continue;
+                }
+                let has_both = min_val.is_some() && max_val.is_some();
+                let mut current = input_idx;
+                if let Some(max) = max_val {
+                    let (max_idx, max_name) = g.reserve_temporary(dtype, vec![]);
+                    extra_constant_data.insert(max_name, (max as f32).to_le_bytes().to_vec());
+                    if has_both {
+                        let (mid_out, _) = g.reserve_temporary(dtype, shape.clone());
+                        g.emit(
+                            &mut fbb,
+                            tfl::op::MINIMUM,
+                            vec![current, max_idx],
+                            vec![mid_out],
+                            0,
+                            None,
+                        );
+                        current = mid_out;
+                    } else {
+                        let out_idx = g.ensure_tensor(&node.output, dtype, &shape);
+                        g.emit(
+                            &mut fbb,
+                            tfl::op::MINIMUM,
+                            vec![current, max_idx],
+                            vec![out_idx],
+                            0,
+                            None,
+                        );
+                        continue;
+                    }
+                }
+                if let Some(min) = min_val {
+                    let (min_idx, min_name) = g.reserve_temporary(dtype, vec![]);
+                    extra_constant_data.insert(min_name, (min as f32).to_le_bytes().to_vec());
+                    let out_idx = g.ensure_tensor(&node.output, dtype, &shape);
+                    g.emit(
+                        &mut fbb,
+                        tfl::op::MAXIMUM,
+                        vec![current, min_idx],
+                        vec![out_idx],
+                        0,
+                        None,
+                    );
+                }
+                continue;
+            },
             "linear" => {
                 let alpha = node.attrs.get("alpha").copied().unwrap_or(1.0) as f32;
                 let beta = node.attrs.get("beta").copied().unwrap_or(0.0) as f32;
@@ -1144,6 +1226,42 @@ pub fn compile_with_input_infos(
                 );
                 continue;
             },
+            "instanceNormalization" | "instance_normalization" => {
+                if node.inputs.is_empty() {
+                    return Err("instanceNormalization needs at least 1 input".to_string());
+                }
+                let input_idx = ensure_input(&mut g, &node.inputs[0], dtype, &shape);
+                let scale_idx = if node.inputs.len() > 1 {
+                    Some(ensure_input(&mut g, &node.inputs[1], dtype, &shape))
+                } else {
+                    None
+                };
+                let bias_idx = if node.inputs.len() > 2 {
+                    Some(ensure_input(&mut g, &node.inputs[2], dtype, &shape))
+                } else {
+                    None
+                };
+                let out_idx = g.ensure_tensor(&node.output, dtype, &shape);
+                // Detect if the input is produced by a NHWC-converting op.
+                // If so, spatial axes are [1,2] (NHWC) instead of [2,3] (NCHW).
+                let is_nhwc = nodes.iter().any(|n| {
+                    n.output == node.inputs[0]
+                        && (n.op == "conv2d"
+                            || n.op == "convTranspose2d"
+                            || n.op.starts_with("averagePool")
+                            || n.op.starts_with("maxPool")
+                            || n.op.starts_with("l2Pool"))
+                });
+                let axes: Vec<u32> = if is_nhwc && shape.len() >= 4 {
+                    vec![1, 2]
+                } else {
+                    vec![2, 3]
+                };
+                g.emit_layer_normalization(
+                    &mut fbb, input_idx, scale_idx, bias_idx, &axes, 1e-5, out_idx,
+                );
+                continue;
+            },
             _ => {},
         }
 
@@ -1228,15 +1346,19 @@ pub fn compile_with_input_infos(
                 "where" |
                 "layerNormalization" |
                 "layer_normalization" |
+                "instanceNormalization" |
+                "instance_normalization" |
                 "dequantizeLinear" |
-                "dequantize_linear"
+                "dequantize_linear" |
+                "clamp"
         ) {
             continue;
         }
         let tfl_code = webnn_op_to_tflite(&node.op)
             .ok_or_else(|| format!("Unsupported WebNN op '{}'", node.op))?;
 
-        let input_indices: Vec<u32> = node.inputs.iter().map(|name| g.tensor_id(name)).collect();
+        let mut input_indices: Vec<u32> =
+            node.inputs.iter().map(|name| g.tensor_id(name)).collect();
         let output_idx = g.tensor_id(&node.output);
         let attrs = &node.attrs;
 
@@ -1251,57 +1373,177 @@ pub fn compile_with_input_infos(
                 let filt_shape = g.tensor_shape.get(filt_name).cloned().unwrap_or_default();
                 let out_shape_nchw = &node.desc.shape;
                 let rank = in_shape.len() as i32;
-                let out_channels = filt_shape[0] as usize;
-                let out_dtype = webnn_type_to_tflite(node.desc.data_type);
-                let all_pads_zero =
-                    (0..4).all(|i| attrs.get(&format!("pad{}", i)).copied().unwrap_or(0.0) == 0.0);
-                let pad = if all_pads_zero {
-                    tfl::padding::VALID
+                let groups = attrs.get("groups").copied().unwrap_or(1.0) as usize;
+                let is_depthwise = groups > 1 && filt_shape[1] == 1;
+
+                if is_depthwise {
+                    let out_channels = filt_shape[0] as usize;
+                    let out_dtype = webnn_type_to_tflite(node.desc.data_type);
+                    let all_pads_zero = (0..4)
+                        .all(|i| attrs.get(&format!("pad{}", i)).copied().unwrap_or(0.0) == 0.0);
+                    let pad = if all_pads_zero {
+                        tfl::padding::VALID
+                    } else {
+                        tfl::padding::SAME
+                    };
+                    let s_h = attrs.get("stride_h").copied().unwrap_or(1.0) as i32;
+                    let s_w = attrs.get("stride_w").copied().unwrap_or(1.0) as i32;
+                    let d_h = attrs.get("dilation_h").copied().unwrap_or(1.0) as i32;
+                    let d_w = attrs.get("dilation_w").copied().unwrap_or(1.0) as i32;
+                    if rank >= 4 {
+                        // NCHW → NHWC for input/output
+                        let nhwc_in_shape: Vec<u32> =
+                            vec![in_shape[0], in_shape[2], in_shape[3], in_shape[1]];
+                        // Depthwise filter: OIHW [C, 1, H, W] → TFLite [1, H, W, C]
+                        let dw_filt_shape: Vec<u32> =
+                            vec![1, filt_shape[2], filt_shape[3], filt_shape[0]];
+                        let nhwc_out_shape: Vec<u32> = vec![
+                            out_shape_nchw[0],
+                            out_shape_nchw[2],
+                            out_shape_nchw[3],
+                            out_shape_nchw[1],
+                        ];
+                        let layout_boundary: std::collections::HashSet<&str> =
+                            ["transpose", "reshape", "concat"].iter().copied().collect();
+                        let producer = nodes.iter().find(|n| n.output == *in_name);
+                        let from_boundary =
+                            producer.map_or(false, |p| layout_boundary.contains(p.op.as_str()));
+                        if from_boundary {
+                            let perm = vec![0i32, 2, 3, 1];
+                            let perm_shape: Vec<u32> = vec![perm.len() as u32];
+                            let (perm_idx, perm_name) = g.reserve_temporary(2, perm_shape);
+                            let perm_bytes: Vec<u8> =
+                                perm.iter().flat_map(|v| v.to_le_bytes()).collect();
+                            extra_constant_data.insert(perm_name, perm_bytes);
+                            let (nhwc_in_idx, nhwc_in_name) =
+                                g.reserve_temporary(out_dtype, nhwc_in_shape.clone());
+                            g.emit(
+                                &mut fbb,
+                                tfl::op::TRANSPOSE,
+                                vec![input_indices[0], perm_idx],
+                                vec![nhwc_in_idx],
+                                0,
+                                None,
+                            );
+                            input_indices[0] = nhwc_in_idx;
+                            nhwc_inputs.push(nhwc_in_name);
+                        } else if nhwc_outputs.contains(in_name) || nhwc_inputs.contains(in_name) {
+                            // Input is already NHWC, don't double-convert.
+                        } else {
+                            g.tensor_shape.insert(in_name.clone(), nhwc_in_shape);
+                            nhwc_inputs.push(in_name.clone());
+                        }
+                        g.tensor_shape.insert(filt_name.clone(), dw_filt_shape);
+                        g.tensor_shape.insert(node.output.clone(), nhwc_out_shape);
+                        nhwc_inputs.push(filt_name.clone());
+                        nhwc_outputs.push(node.output.clone());
+                    }
+                    let bias_idx = if node.inputs.len() > 2 {
+                        g.tensor_id(&node.inputs[2])
+                    } else {
+                        let (idx, name) = g.reserve_temporary(out_dtype, vec![out_channels as u32]);
+                        extra_constant_data.insert(name, vec![0u8; out_channels * 4]);
+                        idx
+                    };
+                    let opt = build_depthwise_conv2d_options(
+                        &mut fbb, pad as u8, s_w, s_h, d_w, d_h, 0, 1,
+                    );
+                    let mut conv_inputs = input_indices.clone();
+                    if node.inputs.len() <= 2 {
+                        conv_inputs.push(bias_idx);
+                    }
+                    g.emit(
+                        &mut fbb,
+                        tfl::op::DEPTHWISE_CONV_2D,
+                        conv_inputs,
+                        vec![output_idx],
+                        tfl::builtin_options::DEPTHWISE_CONV_2D,
+                        Some(opt),
+                    );
                 } else {
-                    // TFLite Conv2D only supports VALID or SAME padding modes,
-                    // not per-side padding values. When WebNN specifies explicit
-                    // non-zero padding, we use SAME padding which approximately
-                    // matches. A more complete fix would insert explicit Pad ops
-                    // before the Conv2D operator.
-                    tfl::padding::SAME
-                };
-                let s_h = attrs.get("stride_h").copied().unwrap_or(1.0) as i32;
-                let s_w = attrs.get("stride_w").copied().unwrap_or(1.0) as i32;
-                let d_h = attrs.get("dilation_h").copied().unwrap_or(1.0) as i32;
-                let d_w = attrs.get("dilation_w").copied().unwrap_or(1.0) as i32;
-                if rank >= 4 {
-                    let nhwc_in_shape: Vec<u32> =
-                        vec![in_shape[0], in_shape[2], in_shape[3], in_shape[1]];
-                    let nhwc_filt_shape: Vec<u32> =
-                        vec![filt_shape[0], filt_shape[2], filt_shape[3], filt_shape[1]];
-                    let nhwc_out_shape: Vec<u32> = vec![
-                        out_shape_nchw[0],
-                        out_shape_nchw[2],
-                        out_shape_nchw[3],
-                        out_shape_nchw[1],
-                    ];
-                    g.tensor_shape.insert(in_name.clone(), nhwc_in_shape);
-                    g.tensor_shape.insert(filt_name.clone(), nhwc_filt_shape);
-                    g.tensor_shape.insert(node.output.clone(), nhwc_out_shape);
-                    nhwc_inputs.push(in_name.clone());
-                    nhwc_inputs.push(filt_name.clone());
-                    nhwc_outputs.push(node.output.clone());
+                    let out_channels = filt_shape[0] as usize;
+                    let out_dtype = webnn_type_to_tflite(node.desc.data_type);
+                    let all_pads_zero = (0..4)
+                        .all(|i| attrs.get(&format!("pad{}", i)).copied().unwrap_or(0.0) == 0.0);
+                    let pad = if all_pads_zero {
+                        tfl::padding::VALID
+                    } else {
+                        tfl::padding::SAME
+                    };
+                    let s_h = attrs.get("stride_h").copied().unwrap_or(1.0) as i32;
+                    let s_w = attrs.get("stride_w").copied().unwrap_or(1.0) as i32;
+                    let d_h = attrs.get("dilation_h").copied().unwrap_or(1.0) as i32;
+                    let d_w = attrs.get("dilation_w").copied().unwrap_or(1.0) as i32;
+                    if rank >= 4 {
+                        let nhwc_in_shape: Vec<u32> =
+                            vec![in_shape[0], in_shape[2], in_shape[3], in_shape[1]];
+                        let nhwc_filt_shape: Vec<u32> =
+                            vec![filt_shape[0], filt_shape[2], filt_shape[3], filt_shape[1]];
+                        let nhwc_out_shape: Vec<u32> = vec![
+                            out_shape_nchw[0],
+                            out_shape_nchw[2],
+                            out_shape_nchw[3],
+                            out_shape_nchw[1],
+                        ];
+                        let layout_boundary: std::collections::HashSet<&str> =
+                            ["transpose", "reshape", "concat"].iter().copied().collect();
+                        let producer = nodes.iter().find(|n| n.output == *in_name);
+                        let from_boundary =
+                            producer.map_or(false, |p| layout_boundary.contains(p.op.as_str()));
+                        if from_boundary {
+                            // Don't overwrite a layout-changing op's output.
+                            // Insert a TRANSPOSE to convert NCHW → NHWC.
+                            let perm = vec![0i32, 2, 3, 1];
+                            let perm_shape: Vec<u32> = vec![perm.len() as u32];
+                            let (perm_idx, perm_name) = g.reserve_temporary(2, perm_shape);
+                            let perm_bytes: Vec<u8> =
+                                perm.iter().flat_map(|v| v.to_le_bytes()).collect();
+                            extra_constant_data.insert(perm_name, perm_bytes);
+                            let (nhwc_in_idx, nhwc_in_name) =
+                                g.reserve_temporary(out_dtype, nhwc_in_shape.clone());
+                            g.emit(
+                                &mut fbb,
+                                tfl::op::TRANSPOSE,
+                                vec![input_indices[0], perm_idx],
+                                vec![nhwc_in_idx],
+                                0,
+                                None,
+                            );
+                            input_indices[0] = nhwc_in_idx;
+                            nhwc_inputs.push(nhwc_in_name);
+                        } else if nhwc_outputs.contains(in_name) || nhwc_inputs.contains(in_name) {
+                            // Input is already NHWC from a prior NHWC-converting op.
+                            // Don't double-convert.
+                        } else {
+                            g.tensor_shape.insert(in_name.clone(), nhwc_in_shape);
+                            nhwc_inputs.push(in_name.clone());
+                        }
+                        g.tensor_shape.insert(filt_name.clone(), nhwc_filt_shape);
+                        g.tensor_shape.insert(node.output.clone(), nhwc_out_shape);
+                        nhwc_inputs.push(filt_name.clone());
+                        nhwc_outputs.push(node.output.clone());
+                    }
+                    let bias_idx = if node.inputs.len() > 2 {
+                        g.tensor_id(&node.inputs[2])
+                    } else {
+                        let (idx, name) = g.reserve_temporary(out_dtype, vec![out_channels as u32]);
+                        extra_constant_data.insert(name, vec![0u8; out_channels * 4]);
+                        idx
+                    };
+                    let opt = build_conv2d_options(&mut fbb, pad as u8, s_w, s_h, d_w, d_h, 0);
+                    let mut conv_inputs = input_indices.clone();
+                    if node.inputs.len() <= 2 {
+                        conv_inputs.push(bias_idx);
+                    }
+                    g.emit(
+                        &mut fbb,
+                        tfl_code,
+                        conv_inputs,
+                        vec![output_idx],
+                        tfl::builtin_options::CONV_2D,
+                        Some(opt),
+                    );
                 }
-                let (bias_idx, bias_name) =
-                    g.reserve_temporary(out_dtype, vec![out_channels as u32]);
-                let bias_bytes: Vec<u8> = vec![0u8; out_channels * 4];
-                extra_constant_data.insert(bias_name, bias_bytes);
-                let opt = build_conv2d_options(&mut fbb, pad as u8, s_w, s_h, d_w, d_h, 0);
-                let mut conv_inputs = input_indices.clone();
-                conv_inputs.push(bias_idx);
-                g.emit(
-                    &mut fbb,
-                    tfl_code,
-                    conv_inputs,
-                    vec![output_idx],
-                    tfl::builtin_options::CONV_2D,
-                    Some(opt),
-                );
             },
             tfl::op::TRANSPOSE_CONV => {
                 if input_indices.len() < 2 {
@@ -1330,9 +1572,38 @@ pub fn compile_with_input_infos(
                         node.desc.shape[3],
                         node.desc.shape[1],
                     ];
-                    g.tensor_shape.insert(in_name.clone(), nhwc_in_shape);
+                    let layout_boundary: std::collections::HashSet<&str> =
+                        ["transpose", "reshape", "concat"].iter().copied().collect();
+                    let producer = nodes.iter().find(|n| n.output == *in_name);
+                    let from_boundary =
+                        producer.map_or(false, |p| layout_boundary.contains(p.op.as_str()));
+                    if from_boundary {
+                        let out_dtype = webnn_type_to_tflite(node.desc.data_type);
+                        let perm = vec![0i32, 2, 3, 1];
+                        let perm_shape: Vec<u32> = vec![perm.len() as u32];
+                        let (perm_idx, perm_name) = g.reserve_temporary(2, perm_shape);
+                        let perm_bytes: Vec<u8> =
+                            perm.iter().flat_map(|v| v.to_le_bytes()).collect();
+                        extra_constant_data.insert(perm_name, perm_bytes);
+                        let (nhwc_in_idx, nhwc_in_name) =
+                            g.reserve_temporary(out_dtype, nhwc_in_shape.clone());
+                        g.emit(
+                            &mut fbb,
+                            tfl::op::TRANSPOSE,
+                            vec![input_indices[0], perm_idx],
+                            vec![nhwc_in_idx],
+                            0,
+                            None,
+                        );
+                        input_indices[0] = nhwc_in_idx;
+                        nhwc_inputs.push(nhwc_in_name);
+                    } else if nhwc_outputs.contains(in_name) || nhwc_inputs.contains(in_name) {
+                        // Already NHWC, don't double-convert.
+                    } else {
+                        g.tensor_shape.insert(in_name.clone(), nhwc_in_shape);
+                        nhwc_inputs.push(in_name.clone());
+                    }
                     g.tensor_shape.insert(node.output.clone(), nhwc_out_shape);
-                    nhwc_inputs.push(in_name.clone());
                     nhwc_outputs.push(node.output.clone());
                 }
                 let w_h = attrs.get("window_h").copied().unwrap_or(in_shape[2] as f64) as i32;
@@ -1423,7 +1694,16 @@ pub fn compile_with_input_infos(
                 }
             },
             tfl::op::CONCATENATION => {
-                let opt = build_concatenation_options(&mut fbb, 0);
+                let mut axis = node.attrs.get("axis").copied().unwrap_or(0.0) as i32;
+                if axis >= 0 && axis < 4 {
+                    let is_nhwc = nhwc_inputs.contains(&node.inputs[0])
+                        || nhwc_outputs.contains(&node.inputs[0]);
+                    if is_nhwc {
+                        let nhwc_map = [0i32, 3, 1, 2];
+                        axis = nhwc_map[axis as usize];
+                    }
+                }
+                let opt = build_concatenation_options(&mut fbb, axis);
                 g.emit(
                     &mut fbb,
                     tfl_code,
@@ -1467,6 +1747,31 @@ pub fn compile_with_input_infos(
                 }
                 if padding_data.is_empty() {
                     return Err("pad needs padding data".to_string());
+                }
+                // If the input has been NHWC-converted, reorder padding
+                // from NCHW order [N,C,H,W] to NHWC order [N,H,W,C].
+                let is_nhwc = rank == 4 &&
+                    (nhwc_inputs.contains(&node.inputs[0]) ||
+                        nhwc_outputs.contains(&node.inputs[0]));
+                if is_nhwc {
+                    let nhwc_map = [0usize, 2, 3, 1];
+                    let mut reordered: Vec<i32> = Vec::with_capacity(padding_data.len());
+                    for &j in &nhwc_map {
+                        reordered.push(padding_data[j * 2]);
+                        reordered.push(padding_data[j * 2 + 1]);
+                    }
+                    padding_data = reordered;
+                    let in_nhwc = g
+                        .tensor_shape
+                        .get(&node.inputs[0])
+                        .cloned()
+                        .unwrap_or_default();
+                    let nhwc_out: Vec<u32> = (0..4)
+                        .map(|d| in_nhwc[d] as i32 + padding_data[d * 2] + padding_data[d * 2 + 1])
+                        .map(|v| v.max(0) as u32)
+                        .collect();
+                    g.tensor_shape.insert(node.output.clone(), nhwc_out);
+                    nhwc_outputs.push(node.output.clone());
                 }
                 let pad_shape: Vec<u32> = vec![rank as u32, 2];
                 let (pad_idx, pad_name) = g.reserve_temporary(2, pad_shape);
@@ -1850,6 +2155,14 @@ pub fn compile_with_input_infos(
                         (0..rank).rev().map(|i| i as i32).collect()
                     }
                 };
+                let in_nhwc =
+                    nhwc_inputs.contains(&node.inputs[0]) || nhwc_outputs.contains(&node.inputs[0]);
+                if in_nhwc && node.desc.shape.len() >= 4 {
+                    let out_shape = &node.desc.shape;
+                    let nhwc_shape: Vec<u32> =
+                        vec![out_shape[0], out_shape[2], out_shape[3], out_shape[1]];
+                    g.tensor_shape.insert(node.output.clone(), nhwc_shape);
+                }
                 let perm_shape: Vec<u32> = vec![perm.len() as u32];
                 let (perm_idx, perm_name) = g.reserve_temporary(2, perm_shape);
                 let perm_bytes: Vec<u8> = perm.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -1870,6 +2183,85 @@ pub fn compile_with_input_infos(
             _ => {
                 g.emit(&mut fbb, tfl_code, input_indices, vec![output_idx], 0, None);
             },
+        }
+    }
+
+    // ── Propagate NHWC shapes backward through element-wise ops ──
+
+    let layout_preserving_ops: std::collections::HashSet<&str> = [
+        "relu",
+        "relu6",
+        "sigmoid",
+        "tanh",
+        "gelu",
+        "elu",
+        "leakyRelu",
+        "abs",
+        "neg",
+        "exp",
+        "log",
+        "sin",
+        "cos",
+        "ceil",
+        "floor",
+        "sqrt",
+        "reciprocal",
+        "hardSwish",
+        "hardSigmoid",
+        "linear",
+        "softplus",
+        "softsign",
+        "identity",
+        "cast",
+        // Binary ops that preserve per-element layout:
+        "add",
+        "sub",
+        "mul",
+        "div",
+        "max",
+        "min",
+        "pow",
+    ]
+    .iter()
+    .copied()
+    .collect();
+
+    let graph_input_set: std::collections::HashSet<&str> = {
+        let all_inputs: std::collections::HashSet<&str> = nodes
+            .iter()
+            .flat_map(|n| n.inputs.iter().map(|s| s.as_str()))
+            .collect();
+        let all_outputs: std::collections::HashSet<&str> =
+            nodes.iter().map(|n| n.output.as_str()).collect();
+        all_inputs
+            .iter()
+            .filter(|n| !all_outputs.contains(*n))
+            .copied()
+            .collect()
+    };
+
+    let mut to_propagate: Vec<String> = nhwc_inputs.clone();
+    let mut propagated: std::collections::HashSet<String> = nhwc_inputs.iter().cloned().collect();
+    for name in &nhwc_outputs {
+        propagated.insert(name.clone());
+    }
+    while let Some(name) = to_propagate.pop() {
+        if let Some(node) = nodes.iter().find(|n| n.output == name) {
+            if layout_preserving_ops.contains(node.op.as_str()) {
+                for inp in &node.inputs {
+                    if let Some(shape) = g.tensor_shape.get(inp).cloned() {
+                        if !propagated.contains(inp.as_str()) && shape.len() >= 4 {
+                            let nshape = vec![shape[0], shape[2], shape[3], shape[1]];
+                            g.tensor_shape.insert(inp.clone(), nshape);
+                            propagated.insert(inp.clone());
+                            to_propagate.push(inp.clone());
+                            if graph_input_set.contains(inp.as_str()) {
+                                nhwc_inputs.push(inp.clone());
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1934,28 +2326,31 @@ pub fn compile_with_input_infos(
         .map(|n| g.tensor_id(n))
         .collect();
     let subgraph_outputs: Vec<u32> = {
-        let mut seen = std::collections::HashSet::new();
-        let mut outs = Vec::new();
-        for (i, n) in nodes.iter().enumerate() {
-            if n.op == "constant" {
-                continue;
+        let output_set: std::collections::HashSet<&str> =
+            output_names.iter().map(|s| s.as_str()).collect();
+        if !output_set.is_empty() {
+            // Only include the requested output nodes.
+            let mut outs = Vec::new();
+            for n in nodes {
+                if output_set.contains(n.output.as_str()) {
+                    outs.push(g.tensor_id(&n.output));
+                }
             }
-            if split_skip.contains(&i) {
-                continue;
+            outs
+        } else {
+            // Legacy fallback: include all non-constant node outputs.
+            let mut outs = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for n in nodes {
+                if n.op == "constant" {
+                    continue;
+                }
+                if seen.insert(n.output.as_str()) {
+                    outs.push(g.tensor_id(&n.output));
+                }
             }
-            if seen.insert(n.output.clone()) {
-                outs.push(g.tensor_id(&n.output));
-            }
+            outs
         }
-        for n in nodes {
-            if n.op == "constant" {
-                continue;
-            }
-            if seen.insert(n.output.clone()) {
-                outs.push(g.tensor_id(&n.output));
-            }
-        }
-        outs
     };
 
     log::error!(
