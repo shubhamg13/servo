@@ -159,6 +159,42 @@ fn webnn_type_to_tflite(dt: DataType) -> u8 {
     }
 }
 
+/// Transpose filter data from OIHW → OHWI (for regular conv2d).
+fn transpose_oihw_to_ohwi(data: &[u8], o: usize, i: usize, h: usize, w: usize) -> Vec<u8> {
+    let esz = 4;
+    let mut out = vec![0u8; data.len()];
+    for oo in 0..o {
+        for ii in 0..i {
+            for hh in 0..h {
+                for ww in 0..w {
+                    let src = ((oo * i + ii) * h + hh) * w + ww;
+                    let dst = ((oo * h + hh) * w + ww) * i + ii;
+                    out[dst * esz..(dst + 1) * esz]
+                        .copy_from_slice(&data[src * esz..(src + 1) * esz]);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Transpose depthwise filter from OIHW [O, 1, H, W] → TFLite [1, H, W, O].
+fn transpose_oihw_to_depthwise(data: &[u8], o: usize, h: usize, w: usize) -> Vec<u8> {
+    let esz = 4;
+    let mut out = vec![0u8; data.len()];
+    for oo in 0..o {
+        for hh in 0..h {
+            for ww in 0..w {
+                let src = (oo * h + hh) * w + ww;
+                let dst = (hh * w + ww) * o + oo;
+                out[dst * esz..(dst + 1) * esz]
+                    .copy_from_slice(&data[src * esz..(src + 1) * esz]);
+            }
+        }
+    }
+    out
+}
+
 // ── TFLite schema field offsets (from tensorflow/lite/schema/schema.fbs) ──
 //
 // OperatorCode: deprecated_builtin_code=0(byte), custom_code=2(string),
@@ -1337,7 +1373,7 @@ pub fn compile_with_input_infos(
             continue;
         }
     // ── Helper: walk backward through layout-preserving ops to detect NHWC ──
-    let layout_preserving_set: std::collections::HashSet<&str> = [
+    let _layout_preserving_set: std::collections::HashSet<&str> = [
         "relu", "relu6", "sigmoid", "tanh", "gelu", "elu", "leakyRelu",
         "abs", "neg", "exp", "log", "sin", "cos", "ceil", "floor",
         "sqrt", "reciprocal", "hardSwish", "hardSigmoid", "linear",
@@ -1491,6 +1527,15 @@ pub fn compile_with_input_infos(
                         nhwc_inputs.push(filt_name.clone());
                         nhwc_outputs.push(node.output.clone());
                     }
+                    // Transpose depthwise filter: OIHW [O,1,H,W] → [1,H,W,O]
+                    if let Some(fdata) = constant_data.get(filt_name.as_str()) {
+                        let o = filt_shape[0] as usize;
+                        let h = filt_shape[2] as usize;
+                        let w = filt_shape[3] as usize;
+                        let trans = transpose_oihw_to_depthwise(fdata, o, h, w);
+                        constant_data.remove(filt_name.as_str());
+                        extra_constant_data.insert(filt_name.clone(), trans);
+                    }
                     let bias_idx = if node.inputs.len() > 2 {
                         g.tensor_id(&node.inputs[2])
                     } else {
@@ -1575,6 +1620,21 @@ pub fn compile_with_input_infos(
                         g.tensor_shape.insert(node.output.clone(), nhwc_out_shape);
                         nhwc_inputs.push(filt_name.clone());
                         nhwc_outputs.push(node.output.clone());
+                    }
+                    // Transpose filter data: OIHW → OHWI
+                    if filt_shape.len() == 4 {
+                        if let Some(fdata) = constant_data.get(filt_name.as_str()) {
+                            let o = filt_shape[0] as usize;
+                            let i = filt_shape[1] as usize;
+                            let h = filt_shape[2] as usize;
+                            let w = filt_shape[3] as usize;
+                            if i > 1 {
+                                log::error!("TFL TRANSPOSING filter {} OIHW [{}x{}x{}x{}]", filt_name, o, i, h, w);
+                                let trans = transpose_oihw_to_ohwi(fdata, o, i, h, w);
+                                constant_data.remove(filt_name.as_str());
+                                extra_constant_data.insert(filt_name.clone(), trans);
+                            }
+                        }
                     }
                     let bias_idx = if node.inputs.len() > 2 {
                         g.tensor_id(&node.inputs[2])
@@ -1748,9 +1808,8 @@ pub fn compile_with_input_infos(
             },
             tfl::op::CONCATENATION => {
                 let mut axis = node.attrs.get("axis").copied().unwrap_or(0.0) as i32;
-                let mut is_nhwc = false;
                 if axis >= 0 && axis < 4 {
-                    is_nhwc = nhwc_inputs.contains(&node.inputs[0])
+                    let is_nhwc = nhwc_inputs.contains(&node.inputs[0])
                         || nhwc_outputs.contains(&node.inputs[0])
                         || is_nhwc_upstream(&node.inputs[0], nodes, &nhwc_inputs, &nhwc_outputs);
                     if is_nhwc {
@@ -2220,15 +2279,27 @@ pub fn compile_with_input_infos(
                 };
                 let in_nhwc =
                     nhwc_inputs.contains(&node.inputs[0]) || nhwc_outputs.contains(&node.inputs[0]);
+                // Detect if this TRANSPOSE output is a user-requested graph output.
+                let is_graph_output = output_names.contains(&node.output);
+                // For graph-output TRANSPOSE with NHWC input: the data is already
+                // NHWC; perm [0,2,3,1] intended as NCHW→NHWC is now a no-op.
+                let adjusted_perm: Vec<i32> = if in_nhwc && is_graph_output
+                    && perm.len() == 4
+                    && perm == [0, 2, 3, 1]
+                {
+                    vec![0, 1, 2, 3]
+                } else {
+                    perm.clone()
+                };
                 if in_nhwc && node.desc.shape.len() >= 4 {
                     let out_shape = &node.desc.shape;
                     let nhwc_shape: Vec<u32> =
                         vec![out_shape[0], out_shape[2], out_shape[3], out_shape[1]];
                     g.tensor_shape.insert(node.output.clone(), nhwc_shape);
                 }
-                let perm_shape: Vec<u32> = vec![perm.len() as u32];
+                let perm_shape: Vec<u32> = vec![adjusted_perm.len() as u32];
                 let (perm_idx, perm_name) = g.reserve_temporary(2, perm_shape);
-                let perm_bytes: Vec<u8> = perm.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let perm_bytes: Vec<u8> = adjusted_perm.iter().flat_map(|v| v.to_le_bytes()).collect();
                 extra_constant_data.insert(perm_name, perm_bytes);
                 let trans_inputs = vec![input_indices[0], perm_idx];
                 g.emit(&mut fbb, tfl_code, trans_inputs, vec![output_idx], 0, None);
@@ -2343,6 +2414,7 @@ pub fn compile_with_input_infos(
                         let nshape = vec![shape[0], shape[2], shape[3], shape[1]];
                         g.tensor_shape.insert(node.output.clone(), nshape);
                         propagated.insert(node.output.clone());
+                        nhwc_outputs.push(node.output.clone());
                         fwd_to_process.push(node.output.clone());
                     }
                 }

@@ -326,12 +326,9 @@ impl Backend for LiteRtBackend {
         let model = Model::from_bytes(flatbuf).map_err(|e| format!("LiteRT load: {}", e))?;
         let mut options =
             CompilationOptions::new().map_err(|e| format!("LiteRT options: {}", e))?;
-        // Use base interpreter only — XNNPACK delegation can fail on large
-        // models, corrupting internal state and causing run-time allocation
-        // failures even when the flatbuffer is valid.
-        // options
-        //     .set_accelerators(Accelerators::CPU)
-        //     .map_err(|e| format!("LiteRT options accelerators: {}", e))?;
+        options
+            .set_accelerators(Accelerators::CPU)
+            .map_err(|e| format!("LiteRT options accelerators: {}", e))?;
 
         let compiled = CompiledModel::new(env, model, &options)
             .map_err(|e| format!("LiteRT compile: {}", e))?;
@@ -485,6 +482,7 @@ impl Backend for LiteRtBackend {
             // the declared shape range using the actual layout strides.
             let extracted = if actual_layout.len() >= 4 && shape.len() >= 4 {
                 let elem_size = dt.element_byte_size();
+                log::error!("LiteRT extract region: shape={:?} actual={:?} bytes={}", shape, actual_layout, bytes.len());
                 extract_output_region(&bytes, elem_size, shape, &actual_layout)
             } else {
                 let expected_bytes =
