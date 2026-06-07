@@ -9,7 +9,7 @@ pub(crate) mod litert;
 
 #[cfg(feature = "litert")]
 use crate::backend::Backend;
-use crate::backend::{DataType, GraphNode, RunResult};
+use crate::backend::{CompiledModel, DataType, GraphNode, RunResult};
 
 /// Compile and run inference using the LiteRT backend.
 pub fn infer(
@@ -18,6 +18,16 @@ pub fn infer(
     input_infos: &[(String, Vec<u32>, DataType)],
     output_names: &[String],
 ) -> Result<RunResult, String> {
+    let model = compile(nodes, input_infos, output_names)?;
+    run(&model, inputs)
+}
+
+/// Compile a WebNN graph into a LiteRT model (without running).
+pub fn compile(
+    nodes: &[GraphNode],
+    input_infos: &[(String, Vec<u32>, DataType)],
+    output_names: &[String],
+) -> Result<CompiledModel, String> {
     let backend = litert::LiteRtBackend;
     log::error!("WebNN using backend: {}", backend.name());
     let model = backend
@@ -26,12 +36,22 @@ pub fn infer(
             log::error!("WebNN compile FAILED: {}", e);
             e
         })?;
-    let result = backend.run(&model, inputs).map_err(|e| {
-        log::error!("WebNN run FAILED: {}", e);
-        e
-    })?;
-    log::error!("WebNN inference OK: {} outputs", result.outputs.len());
-    Ok(result)
+    Ok(model)
+}
+
+/// Run inference with a pre-compiled model.
+pub fn run(model: &CompiledModel, inputs: &[(&str, &[u8])]) -> Result<RunResult, String> {
+    let backend = litert::LiteRtBackend;
+    backend.run(model, inputs)
+}
+
+#[cfg(not(feature = "litert"))]
+pub fn compile(
+    _nodes: &[GraphNode],
+    _input_infos: &[(String, Vec<u32>, DataType)],
+    _output_names: &[String],
+) -> Result<CompiledModel, String> {
+    Err("WebNN backend not available (enable the litert feature)".to_string())
 }
 
 #[cfg(not(feature = "litert"))]
@@ -40,6 +60,14 @@ pub fn infer(
     _inputs: &[(&str, &[u8])],
     _input_infos: &[(String, Vec<u32>, DataType)],
     _output_names: &[String],
+) -> Result<RunResult, String> {
+    Err("WebNN backend not available (enable the litert feature)".to_string())
+}
+
+#[cfg(not(feature = "litert"))]
+pub fn run(
+    _model: &CompiledModel,
+    _inputs: &[(&str, &[u8])],
 ) -> Result<RunResult, String> {
     Err("WebNN backend not available (enable the litert feature)".to_string())
 }

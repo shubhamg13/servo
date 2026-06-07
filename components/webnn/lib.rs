@@ -8,8 +8,10 @@ pub mod compiler;
 #[cfg(feature = "litert")]
 pub mod litert;
 
-pub use backend::{DataType, GraphNode, TensorDesc};
+pub use backend::{CompiledModel, DataType, GraphNode, TensorDesc};
+pub use backends::compile as compile_model;
 pub use backends::infer as run_inference;
+pub use backends::run as run_cached;
 
 /// Start the WebNN backend.
 pub fn start_webnn_backend() -> bool {

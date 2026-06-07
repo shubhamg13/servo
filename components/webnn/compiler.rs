@@ -1336,7 +1336,60 @@ pub fn compile_with_input_infos(
         if node.op == "split" && split_skip.contains(&node_idx) {
             continue;
         }
-        // Skip decomposed ops – already handled in the first pass.
+    // ── Helper: walk backward through layout-preserving ops to detect NHWC ──
+    let layout_preserving_set: std::collections::HashSet<&str> = [
+        "relu", "relu6", "sigmoid", "tanh", "gelu", "elu", "leakyRelu",
+        "abs", "neg", "exp", "log", "sin", "cos", "ceil", "floor",
+        "sqrt", "reciprocal", "hardSwish", "hardSigmoid", "linear",
+        "softplus", "softsign", "identity", "cast",
+        "add", "sub", "mul", "div", "max", "min", "pow",
+    ]
+    .iter()
+    .copied()
+    .collect();
+
+    fn is_nhwc_upstream(
+        name: &str,
+        nodes: &[GraphNode],
+        nhwc_inputs: &[String],
+        nhwc_outputs: &[String],
+    ) -> bool {
+        let nhwc_set: std::collections::HashSet<&str> = nhwc_inputs
+            .iter()
+            .map(|s| s.as_str())
+            .chain(nhwc_outputs.iter().map(|s| s.as_str()))
+            .collect();
+        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut stack: Vec<&str> = vec![name];
+        let lp_set: std::collections::HashSet<&str> = [
+            "relu", "relu6", "sigmoid", "tanh", "gelu", "elu", "leakyRelu",
+            "abs", "neg", "exp", "log", "sin", "cos", "ceil", "floor",
+            "sqrt", "reciprocal", "hardSwish", "hardSigmoid", "linear",
+            "softplus", "softsign", "identity", "cast",
+            "add", "sub", "mul", "div", "max", "min", "pow",
+        ]
+        .iter()
+        .copied()
+        .collect();
+        while let Some(current) = stack.pop() {
+            if nhwc_set.contains(current) {
+                return true;
+            }
+            if !visited.insert(current) {
+                continue;
+            }
+            if let Some(producer) = nodes.iter().find(|n| n.output == current) {
+                if lp_set.contains(producer.op.as_str()) {
+                    for inp in &producer.inputs {
+                        stack.push(inp.as_str());
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    // Skip decomposed ops – already handled in the first pass.
         if matches!(
             node.op.as_str(),
             "batchNormalization" |
@@ -1695,12 +1748,22 @@ pub fn compile_with_input_infos(
             },
             tfl::op::CONCATENATION => {
                 let mut axis = node.attrs.get("axis").copied().unwrap_or(0.0) as i32;
+                let mut is_nhwc = false;
                 if axis >= 0 && axis < 4 {
-                    let is_nhwc = nhwc_inputs.contains(&node.inputs[0])
-                        || nhwc_outputs.contains(&node.inputs[0]);
+                    is_nhwc = nhwc_inputs.contains(&node.inputs[0])
+                        || nhwc_outputs.contains(&node.inputs[0])
+                        || is_nhwc_upstream(&node.inputs[0], nodes, &nhwc_inputs, &nhwc_outputs);
                     if is_nhwc {
                         let nhwc_map = [0i32, 3, 1, 2];
                         axis = nhwc_map[axis as usize];
+                        nhwc_outputs.push(node.output.clone());
+                        let out_shape = &node.desc.shape;
+                        if out_shape.len() >= 4 {
+                            let nhwc_out = vec![
+                                out_shape[0], out_shape[2], out_shape[3], out_shape[1],
+                            ];
+                            g.tensor_shape.insert(node.output.clone(), nhwc_out);
+                        }
                     }
                 }
                 let opt = build_concatenation_options(&mut fbb, axis);
@@ -2259,6 +2322,28 @@ pub fn compile_with_input_infos(
                                 nhwc_inputs.push(inp.clone());
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Propagate NHWC shapes forward through element-wise ops ──
+    // e.g. conv2d output (NHWC) → relu → relu_output should also be NHWC
+    // so concat/other consumers see the right layout.
+    let mut fwd_to_process: Vec<String> = propagated.iter().cloned().collect();
+    while let Some(name) = fwd_to_process.pop() {
+        for node in nodes.iter() {
+            if node.inputs.contains(&name)
+                && layout_preserving_ops.contains(node.op.as_str())
+                && !propagated.contains(node.output.as_str())
+            {
+                if let Some(shape) = g.tensor_shape.get(&node.output).cloned() {
+                    if shape.len() >= 4 {
+                        let nshape = vec![shape[0], shape[2], shape[3], shape[1]];
+                        g.tensor_shape.insert(node.output.clone(), nshape);
+                        propagated.insert(node.output.clone());
+                        fwd_to_process.push(node.output.clone());
                     }
                 }
             }

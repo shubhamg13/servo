@@ -1557,13 +1557,18 @@ impl MLGraphBuilderMethods<crate::DomTypeHolder> for MLGraphBuilder {
     ) -> Result<DomRoot<MLOperand>, Error> {
         check_same_builder(self, [a, b], &options.label.0)?;
         check_same_type(a, b, &options.label.0)?;
+        let a_shape = a.shape();
+        let b_shape = b.shape();
+        let m = a_shape[a_shape.len() - 2];
+        let n = b_shape[b_shape.len() - 1];
+        let output_shape = vec![m, n];
         Ok(make_node_op(
             self,
             &self.global(),
             "matmul",
             &[a, b],
             a.data_type(),
-            a.shape().to_vec(),
+            output_shape,
         ))
     }
 

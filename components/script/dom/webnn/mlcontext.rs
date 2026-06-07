@@ -11,7 +11,7 @@ use script_bindings::record::Record;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 use script_bindings::root::DomRoot;
 #[cfg(feature = "webnn")]
-use webnn::{DataType, GraphNode, TensorDesc, run_inference};
+use webnn::{DataType, GraphNode, TensorDesc, compile_model, run_cached};
 
 use crate::dom::bindings::codegen::Bindings::WebNNBinding::{
     MLContextMethods, MLInputOperandLayout, MLOpSupportLimits, MLOperandDataType, MLRankRange,
@@ -27,6 +27,13 @@ use crate::dom::webnn::mlgraph::MLGraph;
 use crate::dom::webnn::mltensor::MLTensor;
 use crate::realms::InRealm;
 use crate::script_runtime::CanGc;
+
+#[cfg(feature = "webnn")]
+thread_local! {
+    static MODEL_CACHE: std::cell::RefCell<
+        std::collections::HashMap<usize, webnn::CompiledModel>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
 
 #[dom_struct]
 pub(crate) struct MLContext {
@@ -99,61 +106,89 @@ impl MLContextMethods<crate::DomTypeHolder> for MLContext {
         _comp: InRealm,
         _can_gc: CanGc,
     ) {
-        #[cfg(feature = "webnn")]
-        {
-            let nodes = graph.nodes();
-            let mut webnn_nodes = Vec::new();
-            for node in nodes.iter() {
-                webnn_nodes.push(GraphNode {
-                    op: node.op.clone(),
-                    inputs: node.inputs.clone(),
-                    output: node.output.clone(),
-                    desc: TensorDesc {
-                        data_type: DataType::from_u32(node.data_type as u32),
-                        shape: node.shape.clone(),
-                    },
-                    attrs: node.attrs.clone(),
-                    data: node.data.clone(),
-                });
-            }
-
-            let operand_info = graph.input_operand_info();
-            let input_infos: Vec<(String, Vec<u32>, DataType)> = operand_info
-                .iter()
-                .map(|(name, info)| {
-                    (
-                        name.clone(),
-                        info.shape.clone(),
-                        DataType::from_u32(info.data_type as u32),
-                    )
-                })
-                .collect();
-
-            let mut input_data: Vec<(String, Vec<u8>)> = Vec::new();
-            for (name, tensor) in inputs.iter() {
-                if let Some(data) = tensor.read_data() {
-                    input_data.push((name.0.clone(), data));
-                }
-            }
-            let input_slices: Vec<(&str, &[u8])> = input_data
-                .iter()
-                .map(|(n, d)| (n.as_str(), d.as_slice()))
-                .collect();
-
-            let output_names = graph.output_names();
-            let output_internal_names = graph.output_internal_names();
-            let user_to_internal: std::collections::HashMap<String, String> = output_names
-                .iter()
-                .zip(output_internal_names.iter())
-                .map(|(u, i)| (u.clone(), i.clone()))
-                .collect();
-            let internal_names: Vec<String> = outputs
-                .iter()
-                .filter_map(|(user_key, _)| user_to_internal.get(user_key.0.as_str()).cloned())
-                .collect();
-            if let Ok(result) =
-                run_inference(&webnn_nodes, &input_slices, &input_infos, &internal_names)
+            #[cfg(feature = "webnn")]
             {
+                let nodes = graph.nodes();
+                let mut webnn_nodes = Vec::new();
+                for node in nodes.iter() {
+                    webnn_nodes.push(GraphNode {
+                        op: node.op.clone(),
+                        inputs: node.inputs.clone(),
+                        output: node.output.clone(),
+                        desc: TensorDesc {
+                            data_type: DataType::from_u32(node.data_type as u32),
+                            shape: node.shape.clone(),
+                        },
+                        attrs: node.attrs.clone(),
+                        data: node.data.clone(),
+                    });
+                }
+
+                let operand_info = graph.input_operand_info();
+                let input_infos: Vec<(String, Vec<u32>, DataType)> = operand_info
+                    .iter()
+                    .map(|(name, info)| {
+                        (
+                            name.clone(),
+                            info.shape.clone(),
+                            DataType::from_u32(info.data_type as u32),
+                        )
+                    })
+                    .collect();
+
+                let mut input_data: Vec<(String, Vec<u8>)> = Vec::new();
+                for (name, tensor) in inputs.iter() {
+                    if let Some(data) = tensor.read_data() {
+                        input_data.push((name.0.clone(), data));
+                    }
+                }
+                let input_slices: Vec<(&str, &[u8])> = input_data
+                    .iter()
+                    .map(|(n, d)| (n.as_str(), d.as_slice()))
+                    .collect();
+
+                let output_names = graph.output_names();
+                let output_internal_names = graph.output_internal_names();
+                let user_to_internal: std::collections::HashMap<String, String> = output_names
+                    .iter()
+                    .zip(output_internal_names.iter())
+                    .map(|(u, i)| (u.clone(), i.clone()))
+                    .collect();
+                let internal_names: Vec<String> = outputs
+                    .iter()
+                    .filter_map(|(user_key, _)| user_to_internal.get(user_key.0.as_str()).cloned())
+                    .collect();
+                let cache_key: usize = {
+                    let mut h: u64 = 0;
+                    for node in graph.nodes().iter() {
+                        for b in node.op.as_bytes() { h = h.wrapping_mul(1099511628211).wrapping_add(*b as u64); }
+                        for b in node.output.as_bytes() { h = h.wrapping_mul(1099511628211).wrapping_add(*b as u64); }
+                        for s in &node.shape { h = h.wrapping_mul(1099511628211).wrapping_add(*s as u64); }
+                    }
+                    h as usize
+                };
+                let result = MODEL_CACHE.with(|cache| {
+                    if let Some(model) = cache.borrow().get(&cache_key) {
+                        log::error!("WebNN cache HIT key={}", cache_key);
+                        run_cached(model, &input_slices)
+                    } else {
+                        log::error!("WebNN cache MISS key={} compiling", cache_key);
+                        let compiled = compile_model(
+                            &webnn_nodes, &input_infos, &internal_names,
+                        );
+                        match compiled {
+                            Ok(model) => {
+                                let result = run_cached(&model, &input_slices);
+                                if result.is_ok() {
+                                    cache.borrow_mut().insert(cache_key, model);
+                                }
+                                result
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                });
+                if let Ok(result) = result {
                 let mut out_map: std::collections::HashMap<String, Vec<u8>> =
                     std::collections::HashMap::new();
                 for (name, data) in internal_names.iter().zip(result.outputs.into_iter()) {
@@ -308,7 +343,14 @@ impl MLContextMethods<crate::DomTypeHolder> for MLContext {
             ArrayBufferViewOrArrayBuffer::ArrayBuffer(ref data) => unsafe { data.as_slice() },
             ArrayBufferViewOrArrayBuffer::ArrayBufferView(ref data) => unsafe { data.as_slice() },
         };
+        log::error!("WebNN writeTensor: {} bytes, first f32: {:?}", src.len(),
+            if src.len() >= 4 { Some(f32::from_le_bytes([src[0],src[1],src[2],src[3]])) } else { None });
         tensor.write_data(src);
+        // Verify write
+        if let Some(readback) = tensor.read_data() {
+            log::error!("WebNN writeTensor verify: {} bytes, first f32: {:?}", readback.len(),
+                if readback.len() >= 4 { Some(f32::from_le_bytes([readback[0],readback[1],readback[2],readback[3]])) } else { None });
+        }
     }
 
     /// <https://webmachinelearning.github.io/webnn/#dom-mlcontext-opsupportlimits>

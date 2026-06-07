@@ -326,20 +326,34 @@ impl Backend for LiteRtBackend {
         let model = Model::from_bytes(flatbuf).map_err(|e| format!("LiteRT load: {}", e))?;
         let mut options =
             CompilationOptions::new().map_err(|e| format!("LiteRT options: {}", e))?;
-        options
-            .set_accelerators(Accelerators::CPU)
-            .map_err(|e| format!("LiteRT options accelerators: {}", e))?;
+        // Use base interpreter only — XNNPACK delegation can fail on large
+        // models, corrupting internal state and causing run-time allocation
+        // failures even when the flatbuffer is valid.
+        // options
+        //     .set_accelerators(Accelerators::CPU)
+        //     .map_err(|e| format!("LiteRT options accelerators: {}", e))?;
 
         let compiled = CompiledModel::new(env, model, &options)
             .map_err(|e| format!("LiteRT compile: {}", e))?;
 
         // Query actual output layouts after LiteRT delegates (e.g. XNNPACK)
-        // have finalized tensor allocations. The returned dims may be larger
-        // than the model-declared shapes due to SIMD alignment padding.
+        // have finalized tensor allocations. If this fails (e.g. XNNPACK
+        // delegate can't handle some ops), fall back to declared shapes.
         let output_layouts = unsafe {
             let raw = compiled_model_raw(&compiled);
-            get_output_layouts(raw, 0, output_shapes.len())
-                .map_err(|e| format!("LiteRT output layouts: {}", e))?
+            match get_output_layouts(raw, 0, output_shapes.len()) {
+                Ok(layouts) => layouts,
+                Err(e) => {
+                    log::error!(
+                        "LiteRT output layouts failed (non-fatal, using declared): {}",
+                        e
+                    );
+                    output_shapes
+                        .iter()
+                        .map(|(_, s, _)| s.iter().map(|&d| d as i32).collect())
+                        .collect()
+                },
+            }
         };
         for (i, layout) in output_layouts.iter().enumerate() {
             log::error!(
