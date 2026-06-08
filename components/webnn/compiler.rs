@@ -256,10 +256,14 @@ fn build_tensor(
 }
 
 fn build_buffer(fbb: &mut FlatBufferBuilder, data: &[u8]) -> WIPOffset<TableFinishedWIPOffset> {
+    let data_off = if !data.is_empty() {
+        Some(fbb.create_vector(data))
+    } else {
+        None
+    };
     let t = fbb.start_table();
-    if !data.is_empty() {
-        let data_off = fbb.create_vector(data);
-        fbb.push_slot_always(4, data_off);
+    if let Some(off) = data_off {
+        fbb.push_slot_always(4, off);
     }
     fbb.end_table(t)
 }
