@@ -642,6 +642,7 @@ fn test_run_conv2d() {
 fn test_run_max_pool2d() {
     use webnn::backends::infer;
 
+    let _ = env_logger::builder().is_test(true).try_init();
     webnn::litert::initialize().unwrap();
 
     // 1x1x4x4 input, maxPool2d with 2x2 window, stride 2, VALID padding.
@@ -691,5 +692,40 @@ fn test_run_max_pool2d() {
             exp,
             got
         );
+    }
+}
+
+#[test]
+fn test_run_conv_transpose_2d() {
+    use webnn::backends::infer;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+    webnn::litert::initialize().unwrap();
+
+    // Test with graph-input filter (like the WPT test)
+    let nodes = vec![
+        make_node("convTranspose2d", vec!["x", "f"], "y", vec![1, 1, 3, 3], vec![
+            ("stride_h", 1.0),
+            ("stride_w", 1.0),
+        ]),
+    ];
+
+    let input_x: Vec<u8> = vec![1.0f32, 2.0, 3.0, 4.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let input_f: Vec<u8> = vec![1.0f32; 4].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let result = infer(
+        &nodes,
+        &[("x", input_x.as_slice()), ("f", input_f.as_slice())],
+        &[("x".to_string(), vec![1, 1, 2, 2], DataType::Float32),
+          ("f".to_string(), vec![1, 1, 2, 2], DataType::Float32)],
+        &["y".to_string()],
+    ).expect("inference should succeed");
+
+    assert_eq!(result.outputs.len(), 1);
+    let output: Vec<f32> = result.outputs[0]
+        .chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+    assert_eq!(output.len(), 9, "expected 9 floats, got {}", output.len());
+    let expected = vec![1.0, 3.0, 2.0, 4.0, 10.0, 6.0, 3.0, 7.0, 4.0];
+    for (i, (&got, &exp)) in output.iter().zip(expected.iter()).enumerate() {
+        assert!((got - exp).abs() < 1e-4, "output[{}] expected {} got {}", i, exp, got);
     }
 }

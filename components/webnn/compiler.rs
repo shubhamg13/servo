@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use flatbuffers::{FlatBufferBuilder, TableFinishedWIPOffset, WIPOffset};
 
-use crate::backend::{DataType, GraphNode};
+use crate::backend::{DataType, GraphNode, TensorDesc};
 
 // ── TFLite schema enums ──
 
@@ -82,10 +82,14 @@ mod tfl {
         pub const ELU: i32 = 111;
         pub const QUANTIZE: i32 = 114;
         pub const HARD_SWISH: i32 = 117;
+        pub const HARD_SIGMOID: i32 = 119;
         pub const SCATTER_ND: i32 = 122;
         pub const BATCH_MATMUL: i32 = 126;
         pub const CUM_SUM: i32 = 128;
         pub const BROADCAST_TO: i32 = 130;
+        pub const SOFTPLUS: i32 = 94;
+        pub const SOFTSIGN: i32 = 96;
+        pub const SQUARE: i32 = 103;
         pub const GELU: i32 = 150;
         pub const SIGN: i32 = 158;
 
@@ -97,6 +101,7 @@ mod tfl {
     pub mod padding {
         pub const SAME: u8 = 0;
         pub const VALID: u8 = 1;
+        pub const EXPLICIT: u8 = 2;
     }
 
     pub mod activation {
@@ -189,6 +194,25 @@ fn transpose_oihw_to_depthwise(data: &[u8], o: usize, h: usize, w: usize) -> Vec
                 let dst = (hh * w + ww) * o + oo;
                 out[dst * esz..(dst + 1) * esz]
                     .copy_from_slice(&data[src * esz..(src + 1) * esz]);
+            }
+        }
+    }
+    out
+}
+
+/// Transpose convTranspose2d filter from IOHW [C_in, C_out, H, W] → OHWI [C_out, H, W, C_in].
+fn transpose_iohw_to_ohwi(data: &[u8], c_in: usize, c_out: usize, h: usize, w: usize) -> Vec<u8> {
+    let esz = 4;
+    let mut out = vec![0u8; data.len()];
+    for ci in 0..c_in {
+        for co in 0..c_out {
+            for hh in 0..h {
+                for ww in 0..w {
+                    let src = ((ci * c_out + co) * h + hh) * w + ww;
+                    let dst = ((co * h + hh) * w + ww) * c_in + ci;
+                    out[dst * esz..(dst + 1) * esz]
+                        .copy_from_slice(&data[src * esz..(src + 1) * esz]);
+                }
             }
         }
     }
@@ -337,10 +361,10 @@ fn build_transpose_conv_options(
     activation: u8,
 ) -> WIPOffset<TableFinishedWIPOffset> {
     let t = fbb.start_table();
-    fbb.push_slot::<u8>(4, padding, tfl::padding::SAME);
-    fbb.push_slot::<i32>(6, stride_w, 1);
-    fbb.push_slot::<i32>(8, stride_h, 1);
-    fbb.push_slot::<u8>(10, activation, tfl::activation::NONE);
+    fbb.push_slot_always::<u8>(4, padding);
+    fbb.push_slot_always::<i32>(6, stride_w);
+    fbb.push_slot_always::<i32>(8, stride_h);
+    fbb.push_slot_always::<u8>(10, activation);
     fbb.end_table(t)
 }
 
@@ -604,6 +628,12 @@ fn webnn_op_to_tflite(op: &str) -> Option<i32> {
         "floor" => Some(tfl::op::FLOOR),
         "pad" => Some(tfl::op::PAD),
         "prelu" => Some(tfl::op::PRELU),
+        "identity" => Some(tfl::op::RESHAPE),
+        "hardSigmoid" | "hard_sigmoid" => Some(tfl::op::HARD_SIGMOID),
+        "softplus" => Some(tfl::op::SOFTPLUS),
+        "softsign" => Some(tfl::op::SOFTSIGN),
+        "negative" => Some(tfl::op::NEG),
+        "square" => Some(tfl::op::SQUARE),
         "resample2d" | "resample_2d" => Some(tfl::op::RESIZE_BILINEAR),
         "slice" => Some(tfl::op::SLICE),
         "split" => Some(tfl::op::SPLIT_V),
@@ -820,7 +850,7 @@ impl GraphCompiler {
 
         // Compute mean via ReduceMean
         let (mean_out, _) = self.reserve_temporary(dtype, shape.clone());
-        let (axes_idx, _) = self.reserve_temporary(dtype, axes.iter().map(|&a| a).collect());
+        let (axes_idx, _) = self.reserve_temporary(2, axes.iter().map(|&a| a).collect());
         self.emit(
             fbb,
             tfl::op::MEAN,
@@ -919,7 +949,451 @@ impl GraphCompiler {
     }
 }
 
-// ── Public compile entry point ──
+// ── NHWC transpose insertion (Chromium-style pre-processing) ──
+
+const NHWC_SENSITIVE_OPS: &[&str] = &[
+    "conv2d", "conv_2d", "convTranspose2d", "conv_transpose2d",
+    "maxPool2d", "max_pool_2d", "averagePool2d", "average_pool_2d",
+    "l2Pool2d", "l2_pool_2d", "resample2d", "resample_2d",
+];
+
+const LAYOUT_BOUNDARY_OPS: &[&str] = &[
+    "transpose", "reshape", "concat",
+];
+
+/// Insert NCHW↔NHWC transpose ops around NHWC-sensitive operations.
+///
+/// For each conv2d/pool2d/resample2d/convTranspose2d with a 4-D input:
+///  1. Insert TRANSPOSE([0,2,3,1]) before the op (NCHW → NHWC)
+///  2. Insert TRANSPOSE([0,3,1,2]) after  the op (NHWC → NCHW)
+///  3. For conv2d: transpose filter data OIHW → OHWI
+///
+/// Returns (transformed_nodes, extra_filter_data).
+fn insert_nhwc_transposes(
+    nodes: &[GraphNode],
+    constant_data: &std::collections::HashMap<&str, &[u8]>,
+    input_infos: &[(String, Vec<u32>, DataType)],
+) -> (Vec<GraphNode>, std::collections::HashMap<String, Vec<u8>>) {
+    let mut result: Vec<GraphNode> = Vec::with_capacity(nodes.len() * 2);
+    let mut extra_data: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
+
+    // Build forward shape map: output_name → (shape, DataType), using owned keys.
+    let mut shape_map: std::collections::HashMap<String, (Vec<u32>, DataType)> =
+        std::collections::HashMap::new();
+    for node in nodes {
+        shape_map.insert(
+            node.output.clone(),
+            (node.desc.shape.clone(), node.desc.data_type),
+        );
+    }
+    // Seed with graph input shapes.
+    for (name, shape, dt) in input_infos {
+        shape_map.insert(name.clone(), (shape.clone(), *dt));
+    }
+
+    // Set of all input names (which are output names of some node).
+    let _nhwc_set: std::collections::HashSet<String> = std::collections::HashSet::from_iter(
+        nodes
+            .iter()
+            .flat_map(|n| n.inputs.iter())
+            .cloned(),
+    );
+    let mut is_nhwc: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for node in nodes {
+        let is_nhwc_op = NHWC_SENSITIVE_OPS.contains(&node.op.as_str());
+        let rank = node.desc.shape.len();
+
+        if !is_nhwc_op || rank != 4 {
+            result.push(node.clone());
+            continue;
+        }
+
+        let in_name = &node.inputs[0];
+        let in_shape = shape_map.get(in_name).cloned();
+        let Some((nchw_in, in_dtype)) = in_shape else {
+            result.push(node.clone());
+            continue;
+        };
+        if nchw_in.len() != 4 {
+            result.push(node.clone());
+            continue;
+        }
+
+        let nhwc_in: Vec<u32> = vec![nchw_in[0], nchw_in[2], nchw_in[3], nchw_in[1]];
+        let nchw_out = node.desc.shape.clone();
+        let nhwc_out: Vec<u32> = vec![nchw_out[0], nchw_out[2], nchw_out[3], nchw_out[1]];
+        let out_dtype = node.desc.data_type;
+
+        log::error!("NHWC preproc: op={} in_name={:?} nchw_in={:?} nhwc_in={:?} nchw_out={:?} nhwc_out={:?}", node.op, in_name, nchw_in, nhwc_in, nchw_out, nhwc_out);
+
+        // ── Input TRANSPOSE ──
+        let nhwc_in_name: String;
+        let producer_op = nodes.iter().find(|n| n.output == *in_name);
+
+        log::error!("NHWC preproc: producer_op={} for in_name={:?}", producer_op.map_or("(none)", |p| p.op.as_str()), in_name);
+
+        if producer_op.map_or(false, |p| LAYOUT_BOUNDARY_OPS.contains(&p.op.as_str())) {
+            nhwc_in_name = format!("{in_name}_nhwc");
+            let perm = vec![0u32, 2, 3, 1];
+            let mut attrs = std::collections::HashMap::new();
+            attrs.insert("perm_len".into(), perm.len() as f64);
+            for (i, &v) in perm.iter().enumerate() {
+                attrs.insert(format!("perm_{i}"), v as f64);
+            }
+            result.push(GraphNode {
+                op: "transpose".into(),
+                inputs: vec![in_name.clone()],
+                output: nhwc_in_name.clone(),
+                desc: TensorDesc {
+                    data_type: in_dtype,
+                    shape: nhwc_in.clone(),
+                },
+                attrs,
+                data: None,
+            });
+            is_nhwc.insert(nhwc_in_name.clone());
+        } else if is_nhwc.contains(in_name) {
+            nhwc_in_name = in_name.clone();
+            log::error!("NHWC preproc: input {} already nhwc, reusing directly", in_name);
+        } else {
+            // Input is NCHW (from graph input, elementwise op like relu, etc.)
+            // Insert explicit TRANSPOSE to convert to NHWC.
+            nhwc_in_name = format!("{in_name}_nhwc");
+            let perm = vec![0u32, 2, 3, 1];
+            let mut attrs = std::collections::HashMap::new();
+            attrs.insert("perm_len".into(), perm.len() as f64);
+            for (i, &v) in perm.iter().enumerate() {
+                attrs.insert(format!("perm_{i}"), v as f64);
+            }
+            result.push(GraphNode {
+                op: "transpose".into(),
+                inputs: vec![in_name.clone()],
+                output: nhwc_in_name.clone(),
+                desc: TensorDesc {
+                    data_type: in_dtype,
+                    shape: nhwc_in.clone(),
+                },
+                attrs,
+                data: None,
+            });
+            is_nhwc.insert(nhwc_in_name.clone());
+            log::error!("NHWC preproc: TRANSPOSE {} -> {} perm={:?}", in_name, nhwc_in_name, perm);
+        }
+
+        // ── Modified NHWC op ──
+        let nhwc_tmp_out = format!("{}_nhwc_tmp", node.output);
+        let mut nhwc_node = node.clone();
+        nhwc_node.inputs[0] = nhwc_in_name.clone();
+        nhwc_node.output = nhwc_tmp_out.clone();
+        nhwc_node.desc = TensorDesc {
+            data_type: out_dtype,
+            shape: nhwc_out.clone(),
+        };
+        is_nhwc.insert(nhwc_tmp_out.clone());
+        shape_map.insert(nhwc_tmp_out.clone(), (nhwc_out.clone(), out_dtype));
+
+        // For conv2d: rename filter + transpose data (OIHW → OHWI)
+        // For convTranspose2d: rename filter + transpose data (IOHW → OHWI)
+        let is_conv_transpose = node.op == "convTranspose2d" || node.op == "conv_transpose2d";
+        if node.op == "conv2d" || node.op == "conv_2d" || is_conv_transpose {
+            let filt_name = &node.inputs[1];
+            if let Some(filt_shape) = shape_map.get(filt_name).cloned() {
+                if filt_shape.0.len() == 4 {
+                    let (f_shape, _) = &filt_shape;
+                    let nhwc_filt_name = format!("{filt_name}_nhwc");
+                    nhwc_node.inputs[1] = nhwc_filt_name.clone();
+                    let groups = node.attrs.get("groups").copied().unwrap_or(1.0) as usize;
+                    let is_depthwise = !is_conv_transpose && groups > 1 && f_shape[1] == 1;
+                    let (nhwc_filt_shape, filter_perm, _filter_trans_fn) = if is_conv_transpose {
+                        // IOHW [C_in, C_out, H, W] → OHWI [C_out, H, W, C_in]
+                        let perm = vec![1u32, 2, 3, 0];
+                        let shape = vec![f_shape[1], f_shape[2], f_shape[3], f_shape[0]];
+                        (shape, perm, "iohw_to_ohwi" as &str)
+                    } else if is_depthwise {
+                        let perm = vec![0u32, 2, 3, 1];
+                        let shape = vec![1, f_shape[2], f_shape[3], f_shape[0]];
+                        (shape, perm, "depthwise" as &str)
+                    } else {
+                        let perm = vec![0u32, 2, 3, 1];
+                        let shape = vec![f_shape[0], f_shape[2], f_shape[3], f_shape[1]];
+                        (shape, perm, "ohwi" as &str)
+                    };
+                    let mut has_transposed = false;
+                    if let Some(fdata) = constant_data.get(filt_name.as_str()) {
+                        let o = f_shape[0] as usize;
+                        let i = f_shape[1] as usize;
+                        let h = f_shape[2] as usize;
+                        let w = f_shape[3] as usize;
+                        let trans = if is_conv_transpose {
+                            transpose_iohw_to_ohwi(fdata, i, o, h, w)
+                        } else if is_depthwise {
+                            transpose_oihw_to_depthwise(fdata, o, h, w)
+                        } else {
+                            transpose_oihw_to_ohwi(fdata, o, i, h, w)
+                        };
+                        extra_data.insert(nhwc_filt_name.clone(), trans);
+                        has_transposed = true;
+                    }
+                    shape_map
+                        .insert(nhwc_filt_name.clone(), (nhwc_filt_shape.clone(), out_dtype));
+                    if has_transposed {
+                        let transposed_data =
+                            extra_data.get(&nhwc_filt_name).cloned().unwrap_or_default();
+                        result.push(GraphNode {
+                            op: "constant".into(),
+                            inputs: vec![],
+                            output: nhwc_filt_name.clone(),
+                            desc: TensorDesc {
+                                data_type: out_dtype,
+                                shape: nhwc_filt_shape,
+                            },
+                            attrs: std::collections::HashMap::new(),
+                            data: Some(transposed_data),
+                        });
+                    } else {
+                        // Filter is a graph input (no embedded data).
+                        // Insert a TRANSPOSE op to convert filter layout at runtime.
+                        let mut attrs = std::collections::HashMap::new();
+                        attrs.insert("perm_len".into(), filter_perm.len() as f64);
+                        for (i, &v) in filter_perm.iter().enumerate() {
+                            attrs.insert(format!("perm_{i}"), v as f64);
+                        }
+                        result.push(GraphNode {
+                            op: "transpose".into(),
+                            inputs: vec![filt_name.clone()],
+                            output: nhwc_filt_name.clone(),
+                            desc: TensorDesc {
+                                data_type: out_dtype,
+                                shape: nhwc_filt_shape,
+                            },
+                            attrs,
+                            data: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        result.push(nhwc_node);
+
+        // ── Output TRANSPOSE (NHWC → NCHW) ──
+        let perm = vec![0u32, 3, 1, 2];
+        let mut out_attrs = std::collections::HashMap::new();
+        out_attrs.insert("perm_len".into(), perm.len() as f64);
+        for (i, &v) in perm.iter().enumerate() {
+            out_attrs.insert(format!("perm_{i}"), v as f64);
+        }
+        result.push(GraphNode {
+            op: "transpose".into(),
+            inputs: vec![nhwc_tmp_out],
+            output: node.output.clone(),
+            desc: TensorDesc {
+                data_type: out_dtype,
+                shape: nchw_out,
+            },
+            attrs: out_attrs,
+            data: None,
+        });
+    }
+
+    (result, extra_data)
+}
+
+// ── Transpose elimination (Chromium Phase 2) ──
+
+const LAYOUT_AGNOSTIC_UNARY_OPS: &[&str] = &[
+    "relu", "relu6", "sigmoid", "tanh", "elu", "gelu", "hardSwish",
+    "hardSigmoid", "softplus", "softsign", "leakyRelu", "clamp",
+    "abs", "ceil", "floor", "negative", "identity", "exp", "log",
+    "cos", "sin", "sqrt", "square", "cast",
+];
+
+fn is_nhwc_to_nchw(node: &GraphNode) -> bool {
+    if node.op != "transpose" {
+        return false;
+    }
+    let n = node.attrs.get("perm_len").copied().unwrap_or(0.0) as usize;
+    n == 4
+        && node.attrs.get("perm_0").copied().unwrap_or(-1.0) as i32 == 0
+        && node.attrs.get("perm_1").copied().unwrap_or(-1.0) as i32 == 3
+        && node.attrs.get("perm_2").copied().unwrap_or(-1.0) as i32 == 1
+        && node.attrs.get("perm_3").copied().unwrap_or(-1.0) as i32 == 2
+}
+
+fn is_nchw_to_nhwc(node: &GraphNode) -> bool {
+    if node.op != "transpose" {
+        return false;
+    }
+    let n = node.attrs.get("perm_len").copied().unwrap_or(0.0) as usize;
+    n == 4
+        && node.attrs.get("perm_0").copied().unwrap_or(-1.0) as i32 == 0
+        && node.attrs.get("perm_1").copied().unwrap_or(-1.0) as i32 == 2
+        && node.attrs.get("perm_2").copied().unwrap_or(-1.0) as i32 == 3
+        && node.attrs.get("perm_3").copied().unwrap_or(-1.0) as i32 == 1
+}
+
+fn nchw_shape_to_nhwc(shape: &[u32]) -> Vec<u32> {
+    if shape.len() != 4 {
+        return shape.to_vec();
+    }
+    vec![shape[0], shape[2], shape[3], shape[1]]
+}
+
+/// Eliminate redundant NCHW↔NHWC transpose pairs around layout-agnostic ops.
+///
+/// Pattern: T_out(NHWC→NCHW) → [unary ops] → T_in(NCHW→NHWC)
+/// Becomes: [unary ops in NHWC] (transposes removed)
+///
+/// This is the Chromium TransposeEliminationTransformer logic: when a
+/// NHWC→NCHW transpose's NCHW output flows only through layout-agnostic
+/// unary ops and then into a NCHW→NHWC transpose, both transposes can
+/// be removed and the ops between them stay in NHWC.
+fn eliminate_transpose_pairs(mut nodes: Vec<GraphNode>, graph_outputs: &[String]) -> Vec<GraphNode> {
+    let graph_output_set: std::collections::HashSet<String> = graph_outputs.iter().cloned().collect();
+
+    loop {
+        let mut output_to_idx: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for (i, node) in nodes.iter().enumerate() {
+            output_to_idx.insert(node.output.clone(), i);
+        }
+
+        let mut consumers: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, node) in nodes.iter().enumerate() {
+            for input in &node.inputs {
+                consumers.entry(input.clone()).or_default().push(i);
+            }
+        }
+
+        let mut found = false;
+        let mut t1_idx: usize = 0;
+        let mut t2_idx: usize = 0;
+        let mut chain: Vec<usize> = Vec::new();
+        let mut t1_input_name: String = String::new();
+        let mut t2_output_name: String = String::new();
+        let mut replacement_name: String = String::new();
+
+        for i in 0..nodes.len() {
+            if !is_nhwc_to_nchw(&nodes[i]) {
+                continue;
+            }
+
+            let t1_out = nodes[i].output.clone();
+            let t1_in = nodes[i].inputs[0].clone();
+
+            let t1_cons = consumers.get(&t1_out).map(|v| v.len()).unwrap_or(0);
+            if t1_cons != 1 {
+                continue;
+            }
+
+            let first_idx = consumers.get(&t1_out).unwrap()[0];
+
+            let mut cur_idx = first_idx;
+            let mut cur_chain: Vec<usize> = Vec::new();
+            let mut reached_t2 = false;
+            let mut t2_candidate: usize = 0;
+
+            loop {
+                if is_nchw_to_nhwc(&nodes[cur_idx]) {
+                    reached_t2 = true;
+                    t2_candidate = cur_idx;
+                    break;
+                }
+                if LAYOUT_AGNOSTIC_UNARY_OPS.contains(&nodes[cur_idx].op.as_str())
+                    && nodes[cur_idx].inputs.len() == 1
+                {
+                    cur_chain.push(cur_idx);
+                    let op_out = nodes[cur_idx].output.clone();
+                    let op_cons = consumers.get(&op_out).map(|v| v.len()).unwrap_or(0);
+                    if op_cons != 1 {
+                        break;
+                    }
+                    cur_idx = consumers.get(&op_out).unwrap()[0];
+                } else {
+                    break;
+                }
+            }
+
+            if reached_t2 {
+                // Don't eliminate if T_in produces a graph output —
+                // the user explicitly requested that tensor.
+                if graph_output_set.contains(&nodes[t2_candidate].output) {
+                    continue;
+                }
+                // Don't eliminate if any chain node is a graph output.
+                let chain_is_output = cur_chain.iter().any(|&ci| {
+                    graph_output_set.contains(&nodes[ci].output)
+                });
+                if chain_is_output {
+                    continue;
+                }
+                found = true;
+                t1_idx = i;
+                t2_idx = t2_candidate;
+                chain = cur_chain;
+                t1_input_name = t1_in;
+                t2_output_name = nodes[t2_candidate].output.clone();
+                if chain.is_empty() {
+                    replacement_name = t1_input_name.clone();
+                } else {
+                    replacement_name = nodes[t2_idx].inputs[0].clone();
+                }
+                break;
+            }
+        }
+
+        if !found {
+            break;
+        }
+
+        let chain_ops: Vec<&str> = chain.iter().map(|&i| nodes[i].op.as_str()).collect();
+        log::error!(
+            "Transpose elimination: removing T_out({}) → [{}] → T_in({}), replacing {} with {}",
+            nodes[t1_idx].output,
+            chain_ops.join(" → "),
+            nodes[t2_idx].output,
+            t2_output_name,
+            replacement_name,
+        );
+
+        if !chain.is_empty() {
+            let t1_out_name = nodes[t1_idx].output.clone();
+            for input in nodes[chain[0]].inputs.iter_mut() {
+                if *input == t1_out_name {
+                    *input = t1_input_name.clone();
+                }
+            }
+        }
+
+        for &ci in &chain {
+            let nchw = nodes[ci].desc.shape.clone();
+            if nchw.len() == 4 {
+                nodes[ci].desc.shape = nchw_shape_to_nhwc(&nchw);
+            }
+        }
+
+        for node in nodes.iter_mut() {
+            for input in node.inputs.iter_mut() {
+                if *input == t2_output_name {
+                    *input = replacement_name.clone();
+                }
+            }
+        }
+
+        let mut kept = Vec::new();
+        for (i, node) in nodes.into_iter().enumerate() {
+            if i != t1_idx && i != t2_idx {
+                kept.push(node);
+            }
+        }
+        nodes = kept;
+    }
+
+    nodes
+}
 
 /// Compile a WebNN graph into a TFLite flatbuffer model.
 ///
@@ -950,8 +1424,6 @@ pub fn compile_with_input_infos(
 
     let mut fbb = FlatBufferBuilder::new();
     let mut g = GraphCompiler::new();
-    let mut nhwc_inputs: Vec<String> = Vec::new();
-    let mut nhwc_outputs: Vec<String> = Vec::new();
 
     // Pre-scan constant nodes to collect buffer data.
     let mut constant_data: std::collections::HashMap<&str, &[u8]> =
@@ -964,8 +1436,15 @@ pub fn compile_with_input_infos(
         }
     }
 
-    let mut extra_constant_data: std::collections::HashMap<String, Vec<u8>> =
-        std::collections::HashMap::new();
+    // Chromium-style NHWC transpose insertion.
+    let (transformed_nodes, nhwc_extra_data) = insert_nhwc_transposes(nodes, &constant_data, input_infos);
+
+    // Chromium-style transpose elimination: remove redundant NCHW↔NHWC
+    // transpose pairs around layout-agnostic unary ops (relu, sigmoid, etc.)
+    let transformed_nodes = eliminate_transpose_pairs(transformed_nodes, output_names);
+
+    let nodes = &transformed_nodes;
+    let mut extra_constant_data: std::collections::HashMap<String, Vec<u8>> = nhwc_extra_data;
 
     let input_shape_map: std::collections::HashMap<&str, (Vec<u32>, DataType)> = input_infos
         .iter()
@@ -1229,7 +1708,7 @@ pub fn compile_with_input_infos(
                         .map(|n| webnn_type_to_tflite(n.desc.data_type))
                         .unwrap_or(dtype)
                 };
-                let cond_dtype = input_dtype(nodes, &node.inputs[0]);
+                let cond_dtype = input_dtype(&nodes, &node.inputs[0]);
                 let cond_idx = ensure_input(&mut g, &node.inputs[0], cond_dtype, &shape);
                 let true_idx = ensure_input(&mut g, &node.inputs[1], dtype, &shape);
                 let false_idx = ensure_input(&mut g, &node.inputs[2], dtype, &shape);
@@ -1282,20 +1761,10 @@ pub fn compile_with_input_infos(
                     None
                 };
                 let out_idx = g.ensure_tensor(&node.output, dtype, &shape);
-                // Detect if the input is produced by a NHWC-converting op.
-                // If so, spatial axes are [1,2] (NHWC) instead of [2,3] (NCHW).
-                let is_nhwc = nodes.iter().any(|n| {
-                    n.output == node.inputs[0]
-                        && (n.op == "conv2d"
-                            || n.op == "convTranspose2d"
-                            || n.op.starts_with("averagePool")
-                            || n.op.starts_with("maxPool")
-                            || n.op.starts_with("l2Pool"))
-                });
-                let axes: Vec<u32> = if is_nhwc && shape.len() >= 4 {
-                    vec![1, 2]
-                } else {
+                let axes: Vec<u32> = if shape.len() >= 4 {
                     vec![2, 3]
+                } else {
+                    vec![shape.len().saturating_sub(2) as u32, shape.len().saturating_sub(1) as u32]
                 };
                 g.emit_layer_normalization(
                     &mut fbb, input_idx, scale_idx, bias_idx, &axes, 1e-5, out_idx,
@@ -1376,59 +1845,6 @@ pub fn compile_with_input_infos(
         if node.op == "split" && split_skip.contains(&node_idx) {
             continue;
         }
-    // ── Helper: walk backward through layout-preserving ops to detect NHWC ──
-    let _layout_preserving_set: std::collections::HashSet<&str> = [
-        "relu", "relu6", "sigmoid", "tanh", "gelu", "elu", "leakyRelu",
-        "abs", "neg", "exp", "log", "sin", "cos", "ceil", "floor",
-        "sqrt", "reciprocal", "hardSwish", "hardSigmoid", "linear",
-        "softplus", "softsign", "identity", "cast",
-        "add", "sub", "mul", "div", "max", "min", "pow",
-    ]
-    .iter()
-    .copied()
-    .collect();
-
-    fn is_nhwc_upstream(
-        name: &str,
-        nodes: &[GraphNode],
-        nhwc_inputs: &[String],
-        nhwc_outputs: &[String],
-    ) -> bool {
-        let nhwc_set: std::collections::HashSet<&str> = nhwc_inputs
-            .iter()
-            .map(|s| s.as_str())
-            .chain(nhwc_outputs.iter().map(|s| s.as_str()))
-            .collect();
-        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        let mut stack: Vec<&str> = vec![name];
-        let lp_set: std::collections::HashSet<&str> = [
-            "relu", "relu6", "sigmoid", "tanh", "gelu", "elu", "leakyRelu",
-            "abs", "neg", "exp", "log", "sin", "cos", "ceil", "floor",
-            "sqrt", "reciprocal", "hardSwish", "hardSigmoid", "linear",
-            "softplus", "softsign", "identity", "cast",
-            "add", "sub", "mul", "div", "max", "min", "pow",
-        ]
-        .iter()
-        .copied()
-        .collect();
-        while let Some(current) = stack.pop() {
-            if nhwc_set.contains(current) {
-                return true;
-            }
-            if !visited.insert(current) {
-                continue;
-            }
-            if let Some(producer) = nodes.iter().find(|n| n.output == current) {
-                if lp_set.contains(producer.op.as_str()) {
-                    for inp in &producer.inputs {
-                        stack.push(inp.as_str());
-                    }
-                }
-            }
-        }
-        false
-    }
-
     // Skip decomposed ops – already handled in the first pass.
         if matches!(
             node.op.as_str(),
@@ -1450,7 +1866,7 @@ pub fn compile_with_input_infos(
         let tfl_code = webnn_op_to_tflite(&node.op)
             .ok_or_else(|| format!("Unsupported WebNN op '{}'", node.op))?;
 
-        let mut input_indices: Vec<u32> =
+        let input_indices: Vec<u32> =
             node.inputs.iter().map(|name| g.tensor_id(name)).collect();
         let output_idx = g.tensor_id(&node.output);
         let attrs = &node.attrs;
@@ -1460,100 +1876,83 @@ pub fn compile_with_input_infos(
                 if input_indices.len() < 2 {
                     return Err("conv2d needs input and filter".to_string());
                 }
-                let in_name = &node.inputs[0];
                 let filt_name = &node.inputs[1];
-                let in_shape = g.tensor_shape.get(in_name).cloned().unwrap_or_default();
                 let filt_shape = g.tensor_shape.get(filt_name).cloned().unwrap_or_default();
-                let out_shape_nchw = &node.desc.shape;
-                let rank = in_shape.len() as i32;
                 let groups = attrs.get("groups").copied().unwrap_or(1.0) as usize;
-                let is_depthwise = groups > 1 && filt_shape[1] == 1;
-
+                let is_depthwise = groups > 1 && filt_shape.first() == Some(&1);
+                let out_channels = if is_depthwise {
+                    filt_shape.get(3).copied().unwrap_or(0) as usize
+                } else {
+                    filt_shape.get(0).copied().unwrap_or(0) as usize
+                };
+                let out_dtype = webnn_type_to_tflite(node.desc.data_type);
+                let all_pads_zero = (0..4)
+                    .all(|i| attrs.get(&format!("pad{}", i)).copied().unwrap_or(0.0) == 0.0);
+                let (pad, padded_input_idx) = if all_pads_zero {
+                    (tfl::padding::VALID, input_indices[0])
+                } else {
+                    // Insert a PAD op before conv2d and use VALID padding.
+                    let pad_top = attrs.get("pad0").copied().unwrap_or(0.0) as i32;
+                    let pad_bottom = attrs.get("pad1").copied().unwrap_or(0.0) as i32;
+                    let pad_left = attrs.get("pad2").copied().unwrap_or(0.0) as i32;
+                    let pad_right = attrs.get("pad3").copied().unwrap_or(0.0) as i32;
+                    // After NHWC preproc, input is in NHWC format.
+                    // Padding attrs from WebNN are [top, bottom, left, right] in NCHW spatial order.
+                    // In NHWC, pad_dims = [0, top, bottom, left, right, 0] (batch, H_top, H_bot, W_left, W_right, channels).
+                    let default_shape = node.desc.shape.clone();
+                    let input_shape = g
+                        .tensor_shape
+                        .get(&node.inputs[0])
+                        .cloned()
+                        .unwrap_or(default_shape);
+                    let n = *input_shape.get(0).unwrap_or(&1);
+                    let h = *input_shape.get(1).unwrap_or(&1);
+                    let w = *input_shape.get(2).unwrap_or(&1);
+                    let c = *input_shape.get(3).unwrap_or(&1);
+                    let padded_h = h + (pad_top + pad_bottom) as u32;
+                    let padded_w = w + (pad_left + pad_right) as u32;
+                    let padded_shape = vec![n, padded_h, padded_w, c];
+                    let padded_name = format!("{}_padded", node.output);
+                    let padded_idx = g.ensure_tensor(&padded_name, out_dtype, &padded_shape);
+                    // PAD op: TFLite expects paddings shape [rank, 2].
+                    // NHWC layout: [[0,0], [pad_top, pad_bottom], [pad_left, pad_right], [0,0]]
+                    let pad_dims = vec![0i32, 0, pad_top, pad_bottom, pad_left, pad_right, 0, 0];
+                    let pd_shape: Vec<u32> = vec![4, 2];
+                    let (pd_idx, pd_name) = g.reserve_temporary(2, pd_shape);
+                    let pd_bytes: Vec<u8> = pad_dims.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    extra_constant_data.insert(pd_name, pd_bytes);
+                    g.emit(
+                        &mut fbb,
+                        tfl::op::PAD,
+                        vec![input_indices[0], pd_idx],
+                        vec![padded_idx],
+                        0,
+                        None,
+                    );
+                    (tfl::padding::VALID, padded_idx)
+                };
+                let s_h = attrs.get("stride_h").copied().unwrap_or(1.0) as i32;
+                let s_w = attrs.get("stride_w").copied().unwrap_or(1.0) as i32;
+                let d_h = attrs.get("dilation_h").copied().unwrap_or(1.0) as i32;
+                let d_w = attrs.get("dilation_w").copied().unwrap_or(1.0) as i32;
+                let bias_idx = if node.inputs.len() > 2 {
+                    g.tensor_id(&node.inputs[2])
+                } else {
+                    let (idx, name) = g.reserve_temporary(out_dtype, vec![out_channels as u32]);
+                    extra_constant_data.insert(name, vec![0u8; out_channels * 4]);
+                    idx
+                };
+                let mut conv_inputs = vec![padded_input_idx];
+                for i in 1..node.inputs.len().min(input_indices.len()) {
+                    conv_inputs.push(input_indices[i]);
+                }
+                if node.inputs.len() <= 2 {
+                    conv_inputs.push(bias_idx);
+                }
                 if is_depthwise {
-                    let out_channels = filt_shape[0] as usize;
-                    let out_dtype = webnn_type_to_tflite(node.desc.data_type);
-                    let all_pads_zero = (0..4)
-                        .all(|i| attrs.get(&format!("pad{}", i)).copied().unwrap_or(0.0) == 0.0);
-                    let pad = if all_pads_zero {
-                        tfl::padding::VALID
-                    } else {
-                        tfl::padding::SAME
-                    };
-                    let s_h = attrs.get("stride_h").copied().unwrap_or(1.0) as i32;
-                    let s_w = attrs.get("stride_w").copied().unwrap_or(1.0) as i32;
-                    let d_h = attrs.get("dilation_h").copied().unwrap_or(1.0) as i32;
-                    let d_w = attrs.get("dilation_w").copied().unwrap_or(1.0) as i32;
-                    if rank >= 4 {
-                        // NCHW → NHWC for input/output
-                        let nhwc_in_shape: Vec<u32> =
-                            vec![in_shape[0], in_shape[2], in_shape[3], in_shape[1]];
-                        // Depthwise filter: OIHW [C, 1, H, W] → TFLite [1, H, W, C]
-                        let dw_filt_shape: Vec<u32> =
-                            vec![1, filt_shape[2], filt_shape[3], filt_shape[0]];
-                        let nhwc_out_shape: Vec<u32> = vec![
-                            out_shape_nchw[0],
-                            out_shape_nchw[2],
-                            out_shape_nchw[3],
-                            out_shape_nchw[1],
-                        ];
-                        let layout_boundary: std::collections::HashSet<&str> =
-                            ["transpose", "reshape", "concat"].iter().copied().collect();
-                        let producer = nodes.iter().find(|n| n.output == *in_name);
-                        let from_boundary =
-                            producer.map_or(false, |p| layout_boundary.contains(p.op.as_str()));
-                        if from_boundary {
-                            let perm = vec![0i32, 2, 3, 1];
-                            let perm_shape: Vec<u32> = vec![perm.len() as u32];
-                            let (perm_idx, perm_name) = g.reserve_temporary(2, perm_shape);
-                            let perm_bytes: Vec<u8> =
-                                perm.iter().flat_map(|v| v.to_le_bytes()).collect();
-                            extra_constant_data.insert(perm_name, perm_bytes);
-                            let (nhwc_in_idx, nhwc_in_name) =
-                                g.reserve_temporary(out_dtype, nhwc_in_shape.clone());
-                            g.emit(
-                                &mut fbb,
-                                tfl::op::TRANSPOSE,
-                                vec![input_indices[0], perm_idx],
-                                vec![nhwc_in_idx],
-                                0,
-                                None,
-                            );
-                            input_indices[0] = nhwc_in_idx;
-                            nhwc_inputs.push(nhwc_in_name);
-                        } else if nhwc_outputs.contains(in_name) || nhwc_inputs.contains(in_name) {
-                            // Input is already NHWC, don't double-convert.
-                        } else {
-                            g.tensor_shape.insert(in_name.clone(), nhwc_in_shape);
-                            nhwc_inputs.push(in_name.clone());
-                        }
-                        g.tensor_shape.insert(filt_name.clone(), dw_filt_shape);
-                        g.tensor_shape.insert(node.output.clone(), nhwc_out_shape);
-                        nhwc_inputs.push(filt_name.clone());
-                        nhwc_outputs.push(node.output.clone());
-                    }
-                    // Transpose depthwise filter: OIHW [O,1,H,W] → [1,H,W,O]
-                    if let Some(fdata) = constant_data.get(filt_name.as_str()) {
-                        let o = filt_shape[0] as usize;
-                        let h = filt_shape[2] as usize;
-                        let w = filt_shape[3] as usize;
-                        let trans = transpose_oihw_to_depthwise(fdata, o, h, w);
-                        constant_data.remove(filt_name.as_str());
-                        extra_constant_data.insert(filt_name.clone(), trans);
-                    }
-                    let bias_idx = if node.inputs.len() > 2 {
-                        g.tensor_id(&node.inputs[2])
-                    } else {
-                        let (idx, name) = g.reserve_temporary(out_dtype, vec![out_channels as u32]);
-                        extra_constant_data.insert(name, vec![0u8; out_channels * 4]);
-                        idx
-                    };
                     let opt = build_depthwise_conv2d_options(
                         &mut fbb, pad as u8, s_w, s_h, d_w, d_h, 0, 1,
                     );
-                    let mut conv_inputs = input_indices.clone();
-                    if node.inputs.len() <= 2 {
-                        conv_inputs.push(bias_idx);
-                    }
                     g.emit(
                         &mut fbb,
                         tfl::op::DEPTHWISE_CONV_2D,
@@ -1563,95 +1962,8 @@ pub fn compile_with_input_infos(
                         Some(opt),
                     );
                 } else {
-                    let out_channels = filt_shape[0] as usize;
-                    let out_dtype = webnn_type_to_tflite(node.desc.data_type);
-                    let all_pads_zero = (0..4)
-                        .all(|i| attrs.get(&format!("pad{}", i)).copied().unwrap_or(0.0) == 0.0);
-                    let pad = if all_pads_zero {
-                        tfl::padding::VALID
-                    } else {
-                        tfl::padding::SAME
-                    };
-                    let s_h = attrs.get("stride_h").copied().unwrap_or(1.0) as i32;
-                    let s_w = attrs.get("stride_w").copied().unwrap_or(1.0) as i32;
-                    let d_h = attrs.get("dilation_h").copied().unwrap_or(1.0) as i32;
-                    let d_w = attrs.get("dilation_w").copied().unwrap_or(1.0) as i32;
-                    if rank >= 4 {
-                        let nhwc_in_shape: Vec<u32> =
-                            vec![in_shape[0], in_shape[2], in_shape[3], in_shape[1]];
-                        let nhwc_filt_shape: Vec<u32> =
-                            vec![filt_shape[0], filt_shape[2], filt_shape[3], filt_shape[1]];
-                        let nhwc_out_shape: Vec<u32> = vec![
-                            out_shape_nchw[0],
-                            out_shape_nchw[2],
-                            out_shape_nchw[3],
-                            out_shape_nchw[1],
-                        ];
-                        let layout_boundary: std::collections::HashSet<&str> =
-                            ["transpose", "reshape", "concat"].iter().copied().collect();
-                        let producer = nodes.iter().find(|n| n.output == *in_name);
-                        let from_boundary =
-                            producer.map_or(false, |p| layout_boundary.contains(p.op.as_str()));
-                        if from_boundary {
-                            // Don't overwrite a layout-changing op's output.
-                            // Insert a TRANSPOSE to convert NCHW → NHWC.
-                            let perm = vec![0i32, 2, 3, 1];
-                            let perm_shape: Vec<u32> = vec![perm.len() as u32];
-                            let (perm_idx, perm_name) = g.reserve_temporary(2, perm_shape);
-                            let perm_bytes: Vec<u8> =
-                                perm.iter().flat_map(|v| v.to_le_bytes()).collect();
-                            extra_constant_data.insert(perm_name, perm_bytes);
-                            let (nhwc_in_idx, nhwc_in_name) =
-                                g.reserve_temporary(out_dtype, nhwc_in_shape.clone());
-                            g.emit(
-                                &mut fbb,
-                                tfl::op::TRANSPOSE,
-                                vec![input_indices[0], perm_idx],
-                                vec![nhwc_in_idx],
-                                0,
-                                None,
-                            );
-                            input_indices[0] = nhwc_in_idx;
-                            nhwc_inputs.push(nhwc_in_name);
-                        } else if nhwc_outputs.contains(in_name) || nhwc_inputs.contains(in_name) {
-                            // Input is already NHWC from a prior NHWC-converting op.
-                            // Don't double-convert.
-                        } else {
-                            g.tensor_shape.insert(in_name.clone(), nhwc_in_shape);
-                            nhwc_inputs.push(in_name.clone());
-                        }
-                        g.tensor_shape.insert(filt_name.clone(), nhwc_filt_shape);
-                        g.tensor_shape.insert(node.output.clone(), nhwc_out_shape);
-                        nhwc_inputs.push(filt_name.clone());
-                        nhwc_outputs.push(node.output.clone());
-                    }
-                    // Transpose filter data: OIHW → OHWI
-                    if filt_shape.len() == 4 {
-                        if let Some(fdata) = constant_data.get(filt_name.as_str()) {
-                            let o = filt_shape[0] as usize;
-                            let i = filt_shape[1] as usize;
-                            let h = filt_shape[2] as usize;
-                            let w = filt_shape[3] as usize;
-                            if i > 1 {
-                                log::error!("TFL TRANSPOSING filter {} OIHW [{}x{}x{}x{}]", filt_name, o, i, h, w);
-                                let trans = transpose_oihw_to_ohwi(fdata, o, i, h, w);
-                                constant_data.remove(filt_name.as_str());
-                                extra_constant_data.insert(filt_name.clone(), trans);
-                            }
-                        }
-                    }
-                    let bias_idx = if node.inputs.len() > 2 {
-                        g.tensor_id(&node.inputs[2])
-                    } else {
-                        let (idx, name) = g.reserve_temporary(out_dtype, vec![out_channels as u32]);
-                        extra_constant_data.insert(name, vec![0u8; out_channels * 4]);
-                        idx
-                    };
-                    let opt = build_conv2d_options(&mut fbb, pad as u8, s_w, s_h, d_w, d_h, 0);
-                    let mut conv_inputs = input_indices.clone();
-                    if node.inputs.len() <= 2 {
-                        conv_inputs.push(bias_idx);
-                    }
+                    let opt =
+                        build_conv2d_options(&mut fbb, pad as u8, s_w, s_h, d_w, d_h, 0);
                     g.emit(
                         &mut fbb,
                         tfl_code,
@@ -1666,11 +1978,32 @@ pub fn compile_with_input_infos(
                 if input_indices.len() < 2 {
                     return Err("convTranspose2d needs input and filter".to_string());
                 }
-                let opt = build_transpose_conv_options(&mut fbb, tfl::padding::SAME, 1, 1, 0);
+                // TFLite TRANSPOSE_CONV input order: [output_shape, filter, input, bias?]
+                // node.desc.shape is already NHWC from the pre-processing pass.
+                let out_shape_nhwc: Vec<i32> = node.desc.shape.iter().map(|&d| d as i32).collect();
+                let out_shape_shape: Vec<u32> = vec![4];
+                let (out_shape_idx, out_shape_name) = g.reserve_temporary(2, out_shape_shape);
+                let out_shape_bytes: Vec<u8> = out_shape_nhwc.iter().flat_map(|v| v.to_le_bytes()).collect();
+                extra_constant_data.insert(out_shape_name, out_shape_bytes);
+                let s_h = attrs.get("stride_h").copied().unwrap_or(1.0) as i32;
+                let s_w = attrs.get("stride_w").copied().unwrap_or(1.0) as i32;
+                let all_pads_zero = (0..4)
+                    .all(|i| attrs.get(&format!("pad{}", i)).copied().unwrap_or(0.0) == 0.0);
+                let pad = if all_pads_zero {
+                    tfl::padding::VALID
+                } else {
+                    tfl::padding::SAME
+                };
+                let filter_idx = input_indices[1];
+                let opt = build_transpose_conv_options(&mut fbb, pad, s_w, s_h, 0);
+                let mut tc_inputs = vec![out_shape_idx, filter_idx, input_indices[0]];
+                if node.inputs.len() > 2 && input_indices.len() > 2 {
+                    tc_inputs.push(input_indices[2]);
+                }
                 g.emit(
                     &mut fbb,
                     tfl_code,
-                    input_indices.clone(),
+                    tc_inputs,
                     vec![output_idx],
                     tfl::builtin_options::TRANSPOSE_CONV,
                     Some(opt),
@@ -1679,67 +2012,49 @@ pub fn compile_with_input_infos(
             tfl::op::AVERAGE_POOL_2D | tfl::op::MAX_POOL_2D | tfl::op::L2_POOL_2D => {
                 let in_name = &node.inputs[0];
                 let in_shape = g.tensor_shape.get(in_name).cloned().unwrap_or_default();
-                let rank = in_shape.len() as i32;
-                if rank >= 4 {
-                    let nhwc_in_shape: Vec<u32> =
-                        vec![in_shape[0], in_shape[2], in_shape[3], in_shape[1]];
-                    let nhwc_out_shape: Vec<u32> = vec![
-                        node.desc.shape[0],
-                        node.desc.shape[2],
-                        node.desc.shape[3],
-                        node.desc.shape[1],
-                    ];
-                    let layout_boundary: std::collections::HashSet<&str> =
-                        ["transpose", "reshape", "concat"].iter().copied().collect();
-                    let producer = nodes.iter().find(|n| n.output == *in_name);
-                    let from_boundary =
-                        producer.map_or(false, |p| layout_boundary.contains(p.op.as_str()));
-                    if from_boundary {
-                        let out_dtype = webnn_type_to_tflite(node.desc.data_type);
-                        let perm = vec![0i32, 2, 3, 1];
-                        let perm_shape: Vec<u32> = vec![perm.len() as u32];
-                        let (perm_idx, perm_name) = g.reserve_temporary(2, perm_shape);
-                        let perm_bytes: Vec<u8> =
-                            perm.iter().flat_map(|v| v.to_le_bytes()).collect();
-                        extra_constant_data.insert(perm_name, perm_bytes);
-                        let (nhwc_in_idx, nhwc_in_name) =
-                            g.reserve_temporary(out_dtype, nhwc_in_shape.clone());
-                        g.emit(
-                            &mut fbb,
-                            tfl::op::TRANSPOSE,
-                            vec![input_indices[0], perm_idx],
-                            vec![nhwc_in_idx],
-                            0,
-                            None,
-                        );
-                        input_indices[0] = nhwc_in_idx;
-                        nhwc_inputs.push(nhwc_in_name);
-                    } else if nhwc_outputs.contains(in_name) || nhwc_inputs.contains(in_name) {
-                        // Already NHWC, don't double-convert.
-                    } else {
-                        g.tensor_shape.insert(in_name.clone(), nhwc_in_shape);
-                        nhwc_inputs.push(in_name.clone());
-                    }
-                    g.tensor_shape.insert(node.output.clone(), nhwc_out_shape);
-                    nhwc_outputs.push(node.output.clone());
-                }
-                let w_h = attrs.get("window_h").copied().unwrap_or(in_shape[2] as f64) as i32;
-                let w_w = attrs.get("window_w").copied().unwrap_or(in_shape[3] as f64) as i32;
+                let w_h = attrs.get("window_h").copied().unwrap_or(in_shape[1] as f64) as i32;
+                let w_w = attrs.get("window_w").copied().unwrap_or(in_shape[2] as f64) as i32;
                 let s_h = attrs.get("stride_h").copied().unwrap_or(1.0) as i32;
                 let s_w = attrs.get("stride_w").copied().unwrap_or(1.0) as i32;
                 let all_pads_zero =
                     (0..4).all(|i| attrs.get(&format!("pad{}", i)).copied().unwrap_or(0.0) == 0.0);
-                let pad = if all_pads_zero {
-                    tfl::padding::VALID
+                let (pad, pool_input_idx) = if all_pads_zero {
+                    (tfl::padding::VALID, input_indices[0])
                 } else {
-                    tfl::padding::SAME
+                    let pad_top = attrs.get("pad0").copied().unwrap_or(0.0) as i32;
+                    let pad_bottom = attrs.get("pad1").copied().unwrap_or(0.0) as i32;
+                    let pad_left = attrs.get("pad2").copied().unwrap_or(0.0) as i32;
+                    let pad_right = attrs.get("pad3").copied().unwrap_or(0.0) as i32;
+                    let n = *in_shape.get(0).unwrap_or(&1);
+                    let h = *in_shape.get(1).unwrap_or(&1);
+                    let w = *in_shape.get(2).unwrap_or(&1);
+                    let c = *in_shape.get(3).unwrap_or(&1);
+                    let padded_h = h + (pad_top + pad_bottom) as u32;
+                    let padded_w = w + (pad_left + pad_right) as u32;
+                    let padded_shape = vec![n, padded_h, padded_w, c];
+                    let out_dtype = webnn_type_to_tflite(node.desc.data_type);
+                    let padded_name = format!("{}_padded", node.output);
+                    let padded_idx = g.ensure_tensor(&padded_name, out_dtype, &padded_shape);
+                    let pad_dims = vec![0i32, 0, pad_top, pad_bottom, pad_left, pad_right, 0, 0];
+                    let pd_shape: Vec<u32> = vec![4, 2];
+                    let (pd_idx, pd_name) = g.reserve_temporary(2, pd_shape);
+                    let pd_bytes: Vec<u8> = pad_dims.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    extra_constant_data.insert(pd_name, pd_bytes);
+                    g.emit(
+                        &mut fbb,
+                        tfl::op::PAD,
+                        vec![input_indices[0], pd_idx],
+                        vec![padded_idx],
+                        0,
+                        None,
+                    );
+                    (tfl::padding::VALID, padded_idx)
                 };
-                // TFLite Pool2DOptions uses filter_[w/h], not window.
                 let opt = build_pool2d_options(&mut fbb, pad, s_w, s_h, w_w, w_h, 0);
                 g.emit(
                     &mut fbb,
                     tfl_code,
-                    input_indices.clone(),
+                    vec![pool_input_idx],
                     vec![output_idx],
                     tfl::builtin_options::POOL_2D,
                     Some(opt),
@@ -1811,24 +2126,7 @@ pub fn compile_with_input_infos(
                 }
             },
             tfl::op::CONCATENATION => {
-                let mut axis = node.attrs.get("axis").copied().unwrap_or(0.0) as i32;
-                if axis >= 0 && axis < 4 {
-                    let is_nhwc = nhwc_inputs.contains(&node.inputs[0])
-                        || nhwc_outputs.contains(&node.inputs[0])
-                        || is_nhwc_upstream(&node.inputs[0], nodes, &nhwc_inputs, &nhwc_outputs);
-                    if is_nhwc {
-                        let nhwc_map = [0i32, 3, 1, 2];
-                        axis = nhwc_map[axis as usize];
-                        nhwc_outputs.push(node.output.clone());
-                        let out_shape = &node.desc.shape;
-                        if out_shape.len() >= 4 {
-                            let nhwc_out = vec![
-                                out_shape[0], out_shape[2], out_shape[3], out_shape[1],
-                            ];
-                            g.tensor_shape.insert(node.output.clone(), nhwc_out);
-                        }
-                    }
-                }
+                let axis = node.attrs.get("axis").copied().unwrap_or(0.0) as i32;
                 let opt = build_concatenation_options(&mut fbb, axis);
                 g.emit(
                     &mut fbb,
@@ -1871,33 +2169,8 @@ pub fn compile_with_input_infos(
                     padding_data.push(begin);
                     padding_data.push(end);
                 }
-                if padding_data.is_empty() {
+if padding_data.is_empty() {
                     return Err("pad needs padding data".to_string());
-                }
-                // If the input has been NHWC-converted, reorder padding
-                // from NCHW order [N,C,H,W] to NHWC order [N,H,W,C].
-                let is_nhwc = rank == 4 &&
-                    (nhwc_inputs.contains(&node.inputs[0]) ||
-                        nhwc_outputs.contains(&node.inputs[0]));
-                if is_nhwc {
-                    let nhwc_map = [0usize, 2, 3, 1];
-                    let mut reordered: Vec<i32> = Vec::with_capacity(padding_data.len());
-                    for &j in &nhwc_map {
-                        reordered.push(padding_data[j * 2]);
-                        reordered.push(padding_data[j * 2 + 1]);
-                    }
-                    padding_data = reordered;
-                    let in_nhwc = g
-                        .tensor_shape
-                        .get(&node.inputs[0])
-                        .cloned()
-                        .unwrap_or_default();
-                    let nhwc_out: Vec<u32> = (0..4)
-                        .map(|d| in_nhwc[d] as i32 + padding_data[d * 2] + padding_data[d * 2 + 1])
-                        .map(|v| v.max(0) as u32)
-                        .collect();
-                    g.tensor_shape.insert(node.output.clone(), nhwc_out);
-                    nhwc_outputs.push(node.output.clone());
                 }
                 let pad_shape: Vec<u32> = vec![rank as u32, 2];
                 let (pad_idx, pad_name) = g.reserve_temporary(2, pad_shape);
@@ -1929,36 +2202,58 @@ pub fn compile_with_input_infos(
                             .map(|&v| v as i32)
                             .collect()
                     } else {
+                        let default_shape = node.desc.shape.clone();
                         let input_shape = g
                             .tensor_shape
                             .get(&node.inputs[0])
                             .cloned()
-                            .unwrap_or_default();
+                            .unwrap_or(default_shape);
                         let scale_h = node.attrs.get("scale_h").copied().unwrap_or(1.0);
                         let scale_w = node.attrs.get("scale_w").copied().unwrap_or(1.0);
-                        let h = if input_shape.len() >= 1 {
-                            input_shape[input_shape.len() - 2]
+                        // After NHWC preprocessing, 4D spatial inputs are always NHWC [N,H,W,C].
+                        let (h, w) = if input_shape.len() >= 4 {
+                            (input_shape[1] as f64 * scale_h as f64, input_shape[2] as f64 * scale_w as f64)
                         } else {
-                            1
+                            let h = if input_shape.len() >= 2 { input_shape[input_shape.len() - 2] as f64 } else { 1.0 };
+                            let w = if input_shape.len() >= 1 { input_shape[input_shape.len() - 1] as f64 } else { 1.0 };
+                            (h * scale_h as f64, w * scale_w as f64)
                         };
-                        let w = if input_shape.len() >= 2 {
-                            input_shape[input_shape.len() - 1]
-                        } else {
-                            1
-                        };
-                        vec![
-                            (h as f64 * scale_h as f64) as i32,
-                            (w as f64 * scale_w as f64) as i32,
-                        ]
+                        vec![h as i32, w as i32]
                     }
                 };
+                log::error!("RESIZE sizes={:?} input={:?} desc_shape={:?}", sizes, g.tensor_shape.get(&node.inputs[0]), node.desc.shape);
+                let default_shape = node.desc.shape.clone();
                 let input_shape = g
                     .tensor_shape
                     .get(&node.inputs[0])
                     .cloned()
-                    .unwrap_or_default();
+                    .unwrap_or(default_shape);
                 let rank = input_shape.len() as i32;
-                if rank >= 3 {
+                if rank == 4 {
+                    let _out_dtype = webnn_type_to_tflite(node.desc.data_type);
+                    let size_shape: Vec<u32> = vec![sizes.len() as u32];
+                    let (size_idx, size_name) = g.reserve_temporary(2, size_shape);
+                    let size_bytes: Vec<u8> = sizes.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    extra_constant_data.insert(size_name, size_bytes);
+                    let opts = build_resize_bilinear_options(
+                        &mut fbb,
+                        false,
+                        actual_code == tfl::op::RESIZE_BILINEAR,
+                    );
+                    let builtin_opt = if actual_code == tfl::op::RESIZE_NEAREST_NEIGHBOR {
+                        tfl::builtin_options::RESIZE_NEAREST_NEIGHBOR
+                    } else {
+                        tfl::builtin_options::RESIZE_BILINEAR
+                    };
+                    g.emit(
+                        &mut fbb,
+                        actual_code,
+                        vec![input_indices[0], size_idx],
+                        vec![output_idx],
+                        builtin_opt,
+                        Some(opts),
+                    );
+                } else if rank >= 3 {
                     let out_dtype = webnn_type_to_tflite(node.desc.data_type);
                     let perm: Vec<i32> = if rank == 4 {
                         vec![0, 2, 3, 1]
@@ -2072,11 +2367,15 @@ pub fn compile_with_input_infos(
             },
             tfl::op::RESHAPE => {
                 let out_shape: Vec<i32> = node.desc.shape.iter().map(|&s| s as i32).collect();
+                let shape_tensor_shape: Vec<u32> = vec![out_shape.len() as u32];
+                let (shape_idx, shape_name) = g.reserve_temporary(2, shape_tensor_shape);
+                let shape_bytes: Vec<u8> = out_shape.iter().flat_map(|v| v.to_le_bytes()).collect();
+                extra_constant_data.insert(shape_name, shape_bytes);
                 let opt = build_reshape_options(&mut fbb, &out_shape);
                 g.emit(
                     &mut fbb,
                     tfl_code,
-                    input_indices.clone(),
+                    vec![input_indices[0], shape_idx],
                     vec![output_idx],
                     tfl::builtin_options::RESHAPE,
                     Some(opt),
@@ -2212,11 +2511,31 @@ pub fn compile_with_input_infos(
             tfl::op::REDUCE_MAX |
             tfl::op::REDUCE_MIN |
             tfl::op::REDUCE_PROD => {
-                let opt = build_reducer_options(&mut fbb, true);
+                let num_axes = node.attrs.get("axes_len").copied().unwrap_or(0.0) as usize;
+                let axes: Vec<i32> = if num_axes > 0 {
+                    (0..num_axes)
+                        .filter_map(|i| node.attrs.get(&format!("axis_{}", i)))
+                        .map(|&v| v as i32)
+                        .collect()
+                } else {
+                    let default_shape = node.desc.shape.clone();
+                    let input_shape = g
+                        .tensor_shape
+                        .get(&node.inputs[0])
+                        .cloned()
+                        .unwrap_or(default_shape);
+                    (0..input_shape.len() as i32).collect()
+                };
+                let axes_shape: Vec<u32> = vec![axes.len() as u32];
+                let (axes_idx, axes_name) = g.reserve_temporary(2, axes_shape);
+                let axes_bytes: Vec<u8> = axes.iter().flat_map(|v| v.to_le_bytes()).collect();
+                extra_constant_data.insert(axes_name, axes_bytes);
+                let keep_dims = node.attrs.get("keepDimensions").copied().map(|v| v != 0.0).unwrap_or(true);
+                let opt = build_reducer_options(&mut fbb, keep_dims);
                 g.emit(
                     &mut fbb,
                     tfl_code,
-                    input_indices.clone(),
+                    vec![input_indices[0], axes_idx],
                     vec![output_idx],
                     tfl::builtin_options::REDUCER,
                     Some(opt),
@@ -2281,29 +2600,9 @@ pub fn compile_with_input_infos(
                         (0..rank).rev().map(|i| i as i32).collect()
                     }
                 };
-                let in_nhwc =
-                    nhwc_inputs.contains(&node.inputs[0]) || nhwc_outputs.contains(&node.inputs[0]);
-                // Detect if this TRANSPOSE output is a user-requested graph output.
-                let is_graph_output = output_names.contains(&node.output);
-                // For graph-output TRANSPOSE with NHWC input: the data is already
-                // NHWC; perm [0,2,3,1] intended as NCHW→NHWC is now a no-op.
-                let adjusted_perm: Vec<i32> = if in_nhwc && is_graph_output
-                    && perm.len() == 4
-                    && perm == [0, 2, 3, 1]
-                {
-                    vec![0, 1, 2, 3]
-                } else {
-                    perm.clone()
-                };
-                if in_nhwc && node.desc.shape.len() >= 4 {
-                    let out_shape = &node.desc.shape;
-                    let nhwc_shape: Vec<u32> =
-                        vec![out_shape[0], out_shape[2], out_shape[3], out_shape[1]];
-                    g.tensor_shape.insert(node.output.clone(), nhwc_shape);
-                }
-                let perm_shape: Vec<u32> = vec![adjusted_perm.len() as u32];
+                let perm_shape: Vec<u32> = vec![perm.len() as u32];
                 let (perm_idx, perm_name) = g.reserve_temporary(2, perm_shape);
-                let perm_bytes: Vec<u8> = adjusted_perm.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let perm_bytes: Vec<u8> = perm.iter().flat_map(|v| v.to_le_bytes()).collect();
                 extra_constant_data.insert(perm_name, perm_bytes);
                 let trans_inputs = vec![input_indices[0], perm_idx];
                 g.emit(&mut fbb, tfl_code, trans_inputs, vec![output_idx], 0, None);
@@ -2312,7 +2611,7 @@ pub fn compile_with_input_infos(
                 g.emit(
                     &mut fbb,
                     tfl_code,
-                    input_indices.clone(),
+                    vec![input_indices[0]],
                     vec![output_idx],
                     tfl::builtin_options::QUANTIZE,
                     None,
@@ -2324,107 +2623,9 @@ pub fn compile_with_input_infos(
         }
     }
 
-    // ── Propagate NHWC shapes backward through element-wise ops ──
-
-    let layout_preserving_ops: std::collections::HashSet<&str> = [
-        "relu",
-        "relu6",
-        "sigmoid",
-        "tanh",
-        "gelu",
-        "elu",
-        "leakyRelu",
-        "abs",
-        "neg",
-        "exp",
-        "log",
-        "sin",
-        "cos",
-        "ceil",
-        "floor",
-        "sqrt",
-        "reciprocal",
-        "hardSwish",
-        "hardSigmoid",
-        "linear",
-        "softplus",
-        "softsign",
-        "identity",
-        "cast",
-        // Binary ops that preserve per-element layout:
-        "add",
-        "sub",
-        "mul",
-        "div",
-        "max",
-        "min",
-        "pow",
-    ]
-    .iter()
-    .copied()
-    .collect();
-
-    let graph_input_set: std::collections::HashSet<&str> = {
-        let all_inputs: std::collections::HashSet<&str> = nodes
-            .iter()
-            .flat_map(|n| n.inputs.iter().map(|s| s.as_str()))
-            .collect();
-        let all_outputs: std::collections::HashSet<&str> =
-            nodes.iter().map(|n| n.output.as_str()).collect();
-        all_inputs
-            .iter()
-            .filter(|n| !all_outputs.contains(*n))
-            .copied()
-            .collect()
-    };
-
-    let mut to_propagate: Vec<String> = nhwc_inputs.clone();
-    let mut propagated: std::collections::HashSet<String> = nhwc_inputs.iter().cloned().collect();
-    for name in &nhwc_outputs {
-        propagated.insert(name.clone());
-    }
-    while let Some(name) = to_propagate.pop() {
-        if let Some(node) = nodes.iter().find(|n| n.output == name) {
-            if layout_preserving_ops.contains(node.op.as_str()) {
-                for inp in &node.inputs {
-                    if let Some(shape) = g.tensor_shape.get(inp).cloned() {
-                        if !propagated.contains(inp.as_str()) && shape.len() >= 4 {
-                            let nshape = vec![shape[0], shape[2], shape[3], shape[1]];
-                            g.tensor_shape.insert(inp.clone(), nshape);
-                            propagated.insert(inp.clone());
-                            to_propagate.push(inp.clone());
-                            if graph_input_set.contains(inp.as_str()) {
-                                nhwc_inputs.push(inp.clone());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // ── Propagate NHWC shapes forward through element-wise ops ──
-    // e.g. conv2d output (NHWC) → relu → relu_output should also be NHWC
-    // so concat/other consumers see the right layout.
-    let mut fwd_to_process: Vec<String> = propagated.iter().cloned().collect();
-    while let Some(name) = fwd_to_process.pop() {
-        for node in nodes.iter() {
-            if node.inputs.contains(&name)
-                && layout_preserving_ops.contains(node.op.as_str())
-                && !propagated.contains(node.output.as_str())
-            {
-                if let Some(shape) = g.tensor_shape.get(&node.output).cloned() {
-                    if shape.len() >= 4 {
-                        let nshape = vec![shape[0], shape[2], shape[3], shape[1]];
-                        g.tensor_shape.insert(node.output.clone(), nshape);
-                        propagated.insert(node.output.clone());
-                        nhwc_outputs.push(node.output.clone());
-                        fwd_to_process.push(node.output.clone());
-                    }
-                }
-            }
-        }
-    }
+    // ── NHWC shape propagation is now handled by insert_nhwc_transposes() ──
+    // Pre-processing inserts explicit TRANSPOSE ops with correct NHWC shapes.
+    // No post-hoc shape conversion needed here.
 
     // ── Finalize ──
 
@@ -2577,7 +2778,7 @@ pub fn compile_with_input_infos(
 
     Ok(CompileResult {
         flatbuf: result,
-        nhwc_inputs,
-        nhwc_outputs,
+        nhwc_inputs: Vec::new(),
+        nhwc_outputs: Vec::new(),
     })
 }

@@ -22,3 +22,6 @@ flatbuffers = { workspace = true }
 litert = { workspace = true, optional = true }
 litert-sys = { workspace = true, optional = true }
 log = { workspace = true }
+
+[dev-dependencies]
+env_logger = { workspace = true }

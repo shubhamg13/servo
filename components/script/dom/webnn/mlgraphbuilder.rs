@@ -48,6 +48,35 @@ fn err_type(msg: &str, label: &str) -> Error {
     Error::Type(CString::new(full).unwrap())
 }
 
+fn reduce_attrs(options: &MLReduceOptions) -> OpAttrs {
+    let mut attrs = OpAttrs::new();
+    if let Some(ref axes) = options.axes {
+        for (i, &a) in axes.iter().enumerate() {
+            attrs.insert(format!("axis_{}", i), a as f64);
+        }
+        attrs.insert("axes_len".to_string(), axes.len() as f64);
+    }
+    attrs.insert("keepDimensions".to_string(), if options.keepDimensions { 1.0 } else { 0.0 });
+    attrs
+}
+
+fn reduce_output_shape(input_shape: &[u32], options: &MLReduceOptions) -> Vec<u32> {
+    let axes: Vec<usize> = options.axes.as_ref().map_or_else(
+        || (0..input_shape.len()).collect(),
+        |a| a.iter().map(|&x| x as usize).collect(),
+    );
+    if options.keepDimensions {
+        input_shape.iter().enumerate().map(|(i, &d)| {
+            if axes.contains(&i) { 1 } else { d }
+        }).collect()
+    } else {
+        input_shape.iter().enumerate()
+            .filter(|(i, _)| !axes.contains(i))
+            .map(|(_, &d)| d)
+            .collect()
+    }
+}
+
 fn make_node_op(
     builder: &MLGraphBuilder,
     global: &GlobalScope,
@@ -258,27 +287,14 @@ impl MLGraphBuilder {
         let stride_w = options.strides.as_ref().map(|s| s[1]).unwrap_or(1);
 
         let (out_h, out_w) = if !auto_pad {
-            // Explicit padding was given. Match compiler behaviour:
-            // all-zero pads → VALID formula, non-zero pads → SAME formula.
-            let all_pads_zero =
-                (0..4).all(|i| options.padding.as_ref().map(|p| p[i]).unwrap_or(0) == 0);
-            if all_pads_zero {
-                let oh = if window_h > in_shape[2] {
-                    1
-                } else {
-                    (in_shape[2] - window_h) / stride_h + 1
-                };
-                let ow = if window_w > in_shape[3] {
-                    1
-                } else {
-                    (in_shape[3] - window_w) / stride_w + 1
-                };
-                (oh, ow)
-            } else {
-                let oh = (in_shape[2] + stride_h - 1) / stride_h;
-                let ow = (in_shape[3] + stride_w - 1) / stride_w;
-                (oh, ow)
-            }
+            // Explicit padding: output = (input + pad_begin + pad_end - window) / stride + 1
+            let pad_top = options.padding.as_ref().map(|p| p[0]).unwrap_or(0);
+            let pad_bottom = options.padding.as_ref().map(|p| p[1]).unwrap_or(0);
+            let pad_left = options.padding.as_ref().map(|p| p[2]).unwrap_or(0);
+            let pad_right = options.padding.as_ref().map(|p| p[3]).unwrap_or(0);
+            let oh = (in_shape[2] + pad_top + pad_bottom - window_h) / stride_h + 1;
+            let ow = (in_shape[3] + pad_left + pad_right - window_w) / stride_w + 1;
+            (oh, ow)
         } else {
             let oh = if window_h > in_shape[2] {
                 1
@@ -1702,28 +1718,14 @@ impl MLGraphBuilderMethods<crate::DomTypeHolder> for MLGraphBuilder {
             };
             (oh, ow)
         } else {
-            // Explicit padding was given. The compiler uses SAME mode for
-            // non-zero padding and VALID for all-zero padding. Match that
-            // so the declared output shape agrees with TFLite's output.
-            let all_pads_zero =
-                (0..4).all(|i| options.padding.as_ref().map(|p| p[i]).unwrap_or(0) == 0);
-            if all_pads_zero {
-                let oh = if effective_filter_h > in_shape[2] {
-                    1
-                } else {
-                    (in_shape[2] - effective_filter_h) / stride_h + 1
-                };
-                let ow = if effective_filter_w > in_shape[3] {
-                    1
-                } else {
-                    (in_shape[3] - effective_filter_w) / stride_w + 1
-                };
-                (oh, ow)
-            } else {
-                let oh = (in_shape[2] + stride_h - 1) / stride_h;
-                let ow = (in_shape[3] + stride_w - 1) / stride_w;
-                (oh, ow)
-            }
+            // Explicit padding: output = (input + pad_begin + pad_end - filter) / stride + 1
+            let pad_top = options.padding.as_ref().map(|p| p[0] as u32).unwrap_or(0);
+            let pad_bottom = options.padding.as_ref().map(|p| p[1] as u32).unwrap_or(0);
+            let pad_left = options.padding.as_ref().map(|p| p[2] as u32).unwrap_or(0);
+            let pad_right = options.padding.as_ref().map(|p| p[3] as u32).unwrap_or(0);
+            let oh = (in_shape[2] + pad_top + pad_bottom - effective_filter_h) / stride_h + 1;
+            let ow = (in_shape[3] + pad_left + pad_right - effective_filter_w) / stride_w + 1;
+            (oh, ow)
         };
         let output_shape = vec![in_shape[0], out_channels, out_h, out_w];
         let mut inputs: Vec<&MLOperand> = vec![input, filter];
@@ -1746,16 +1748,74 @@ impl MLGraphBuilderMethods<crate::DomTypeHolder> for MLGraphBuilder {
         &self,
         input: &MLOperand,
         filter: &MLOperand,
-        _options: &MLConvTranspose2dOptions,
+        options: &MLConvTranspose2dOptions,
     ) -> Result<DomRoot<MLOperand>, Error> {
-        check_same_builder(self, [input, filter], &_options.parent.label.0)?;
-        Ok(make_node_op(
+        check_same_builder(self, [input, filter], &options.parent.label.0)?;
+        let mut attrs = OpAttrs::new();
+        let mut auto_pad = true;
+        if let Some(ref p) = options.padding {
+            auto_pad = false;
+            for (i, &v) in p.iter().enumerate() {
+                attrs.insert(format!("pad{}", i), v as f64);
+            }
+        }
+        if let Some(ref s) = options.strides {
+            attrs.insert("stride_h".to_string(), s[0] as f64);
+            if s.len() > 1 {
+                attrs.insert("stride_w".to_string(), s[1] as f64);
+            }
+        }
+        if let Some(ref d) = options.dilations {
+            attrs.insert("dilation_h".to_string(), d[0] as f64);
+            if d.len() > 1 {
+                attrs.insert("dilation_w".to_string(), d[1] as f64);
+            }
+        }
+        attrs.insert("groups".to_string(), options.groups as f64);
+        let in_shape = input.shape();
+        let filt_shape = filter.shape();
+        let stride_h = options.strides.as_ref().map(|s| s[0] as u32).unwrap_or(1);
+        let stride_w = options.strides.as_ref().map(|s| s[1] as u32).unwrap_or(1);
+        let dilation_h = options.dilations.as_ref().map(|d| d[0] as u32).unwrap_or(1);
+        let dilation_w = options.dilations.as_ref().map(|d| d[1] as u32).unwrap_or(1);
+        let effective_filter_h = (filt_shape[2] - 1) * dilation_h + 1;
+        let effective_filter_w = (filt_shape[3] - 1) * dilation_w + 1;
+        let out_channels = filt_shape[1];
+        let (out_h, out_w) = if let Some(ref os) = options.outputSizes {
+            (os[0], os[1])
+        } else if !auto_pad {
+            // Explicit padding given
+            let pad_top = options.padding.as_ref().map(|p| p[0]).unwrap_or(0);
+            let pad_bottom = options.padding.as_ref().map(|p| p[1]).unwrap_or(0);
+            let pad_left = options.padding.as_ref().map(|p| p[2]).unwrap_or(0);
+            let pad_right = options.padding.as_ref().map(|p| p[3]).unwrap_or(0);
+            let oh = stride_h * (in_shape[2] - 1) + effective_filter_h - pad_top - pad_bottom;
+            let ow = stride_w * (in_shape[3] - 1) + effective_filter_w - pad_left - pad_right;
+            (oh, ow)
+        } else {
+            // No explicit padding, no output sizes — compute SAME-like output
+            let oh = stride_h * (in_shape[2] - 1) + effective_filter_h;
+            let ow = stride_w * (in_shape[3] - 1) + effective_filter_w;
+            (oh, ow)
+        };
+        let output_shape = vec![in_shape[0], out_channels, out_h, out_w];
+        if let Some(ref os) = options.outputSizes {
+            attrs.insert("outputSizes0".to_string(), os[0] as f64);
+            attrs.insert("outputSizes1".to_string(), os[1] as f64);
+        }
+        let mut inputs: Vec<&MLOperand> = vec![input, filter];
+        if let Some(ref bias_op) = options.bias {
+            inputs.push(&**bias_op);
+        }
+        Ok(make_node_op_with_attrs(
             self,
             &self.global(),
             "convTranspose2d",
-            &[input, filter],
+            &inputs,
             input.data_type(),
-            input.shape().to_vec(),
+            output_shape,
+            attrs,
+            None,
         ))
     }
 
@@ -1764,160 +1824,190 @@ impl MLGraphBuilderMethods<crate::DomTypeHolder> for MLGraphBuilder {
     fn ReduceL1(
         &self,
         input: &MLOperand,
-        _options: &MLReduceOptions,
+        options: &MLReduceOptions,
     ) -> Result<DomRoot<MLOperand>, Error> {
-        check_same_builder(self, [input], &_options.parent.label.0)?;
-        Ok(make_node_op(
+        check_same_builder(self, [input], &options.parent.label.0)?;
+        let attrs = reduce_attrs(options);
+        Ok(make_node_op_with_attrs(
             self,
             &self.global(),
             "reduceL1",
             &[input],
             input.data_type(),
-            input.shape().to_vec(),
+            reduce_output_shape(input.shape(), options),
+            attrs,
+            None,
         ))
     }
 
     fn ReduceL2(
         &self,
         input: &MLOperand,
-        _options: &MLReduceOptions,
+        options: &MLReduceOptions,
     ) -> Result<DomRoot<MLOperand>, Error> {
-        check_same_builder(self, [input], &_options.parent.label.0)?;
-        Ok(make_node_op(
+        check_same_builder(self, [input], &options.parent.label.0)?;
+        let attrs = reduce_attrs(options);
+        Ok(make_node_op_with_attrs(
             self,
             &self.global(),
             "reduceL2",
             &[input],
             input.data_type(),
-            input.shape().to_vec(),
+            reduce_output_shape(input.shape(), options),
+            attrs,
+            None,
         ))
     }
 
     fn ReduceLogSum(
         &self,
         input: &MLOperand,
-        _options: &MLReduceOptions,
+        options: &MLReduceOptions,
     ) -> Result<DomRoot<MLOperand>, Error> {
-        check_same_builder(self, [input], &_options.parent.label.0)?;
-        Ok(make_node_op(
+        check_same_builder(self, [input], &options.parent.label.0)?;
+        let attrs = reduce_attrs(options);
+        Ok(make_node_op_with_attrs(
             self,
             &self.global(),
             "reduceLogSum",
             &[input],
             input.data_type(),
-            input.shape().to_vec(),
+            reduce_output_shape(input.shape(), options),
+            attrs,
+            None,
         ))
     }
 
     fn ReduceLogSumExp(
         &self,
         input: &MLOperand,
-        _options: &MLReduceOptions,
+        options: &MLReduceOptions,
     ) -> Result<DomRoot<MLOperand>, Error> {
-        check_same_builder(self, [input], &_options.parent.label.0)?;
-        Ok(make_node_op(
+        check_same_builder(self, [input], &options.parent.label.0)?;
+        let attrs = reduce_attrs(options);
+        Ok(make_node_op_with_attrs(
             self,
             &self.global(),
             "reduceLogSumExp",
             &[input],
             input.data_type(),
-            input.shape().to_vec(),
+            reduce_output_shape(input.shape(), options),
+            attrs,
+            None,
         ))
     }
 
     fn ReduceMax(
         &self,
         input: &MLOperand,
-        _options: &MLReduceOptions,
+        options: &MLReduceOptions,
     ) -> Result<DomRoot<MLOperand>, Error> {
-        check_same_builder(self, [input], &_options.parent.label.0)?;
-        Ok(make_node_op(
+        check_same_builder(self, [input], &options.parent.label.0)?;
+        let attrs = reduce_attrs(options);
+        Ok(make_node_op_with_attrs(
             self,
             &self.global(),
             "reduceMax",
             &[input],
             input.data_type(),
-            input.shape().to_vec(),
+            reduce_output_shape(input.shape(), options),
+            attrs,
+            None,
         ))
     }
 
     fn ReduceMean(
         &self,
         input: &MLOperand,
-        _options: &MLReduceOptions,
+        options: &MLReduceOptions,
     ) -> Result<DomRoot<MLOperand>, Error> {
-        check_same_builder(self, [input], &_options.parent.label.0)?;
-        Ok(make_node_op(
+        check_same_builder(self, [input], &options.parent.label.0)?;
+        let attrs = reduce_attrs(options);
+        Ok(make_node_op_with_attrs(
             self,
             &self.global(),
             "reduceMean",
             &[input],
             input.data_type(),
-            input.shape().to_vec(),
+            reduce_output_shape(input.shape(), options),
+            attrs,
+            None,
         ))
     }
 
     fn ReduceMin(
         &self,
         input: &MLOperand,
-        _options: &MLReduceOptions,
+        options: &MLReduceOptions,
     ) -> Result<DomRoot<MLOperand>, Error> {
-        check_same_builder(self, [input], &_options.parent.label.0)?;
-        Ok(make_node_op(
+        check_same_builder(self, [input], &options.parent.label.0)?;
+        let attrs = reduce_attrs(options);
+        Ok(make_node_op_with_attrs(
             self,
             &self.global(),
             "reduceMin",
             &[input],
             input.data_type(),
-            input.shape().to_vec(),
+            reduce_output_shape(input.shape(), options),
+            attrs,
+            None,
         ))
     }
 
     fn ReduceProduct(
         &self,
         input: &MLOperand,
-        _options: &MLReduceOptions,
+        options: &MLReduceOptions,
     ) -> Result<DomRoot<MLOperand>, Error> {
-        check_same_builder(self, [input], &_options.parent.label.0)?;
-        Ok(make_node_op(
+        check_same_builder(self, [input], &options.parent.label.0)?;
+        let attrs = reduce_attrs(options);
+        Ok(make_node_op_with_attrs(
             self,
             &self.global(),
             "reduceProduct",
             &[input],
             input.data_type(),
-            input.shape().to_vec(),
+            reduce_output_shape(input.shape(), options),
+            attrs,
+            None,
         ))
     }
 
     fn ReduceSum(
         &self,
         input: &MLOperand,
-        _options: &MLReduceOptions,
+        options: &MLReduceOptions,
     ) -> Result<DomRoot<MLOperand>, Error> {
-        check_same_builder(self, [input], &_options.parent.label.0)?;
-        Ok(make_node_op(
+        check_same_builder(self, [input], &options.parent.label.0)?;
+        let attrs = reduce_attrs(options);
+        Ok(make_node_op_with_attrs(
             self,
             &self.global(),
             "reduceSum",
             &[input],
             input.data_type(),
-            input.shape().to_vec(),
+            reduce_output_shape(input.shape(), options),
+            attrs,
+            None,
         ))
     }
 
     fn ReduceSumSquare(
         &self,
         input: &MLOperand,
-        _options: &MLReduceOptions,
+        options: &MLReduceOptions,
     ) -> Result<DomRoot<MLOperand>, Error> {
-        check_same_builder(self, [input], &_options.parent.label.0)?;
-        Ok(make_node_op(
+        check_same_builder(self, [input], &options.parent.label.0)?;
+        let attrs = reduce_attrs(options);
+        Ok(make_node_op_with_attrs(
             self,
             &self.global(),
             "reduceSumSquare",
             &[input],
             input.data_type(),
-            input.shape().to_vec(),
+            reduce_output_shape(input.shape(), options),
+            attrs,
+            None,
         ))
     }
 
