@@ -51,6 +51,61 @@ pub fn run(graph_id: usize, inputs: &[(&str, &[u8])], output_names: &[String]) -
     with_backend(|b| b.run(graph_id, inputs, output_names))
 }
 
+// ── Async dispatch — non-blocking JS thread ──
+
+use std::sync::{Arc, Condvar};
+use std::thread;
+
+pub struct Ticket {
+    result: Arc<(Mutex<Option<Result<RunResult, String>>>, Condvar)>,
+}
+
+impl Ticket {
+    pub fn flush(self) -> Result<RunResult, String> {
+        let (lock, cvar) = &*self.result;
+        let mut r = lock.lock().unwrap();
+        if r.is_none() { r = cvar.wait(r).unwrap(); }
+        r.take().unwrap()
+    }
+}
+
+use std::sync::mpsc::{channel, Sender};
+
+struct Task {
+    graph_id: usize,
+    inputs: Vec<(String, Vec<u8>)>,
+    output_names: Vec<String>,
+    ticket: Arc<(Mutex<Option<Result<RunResult, String>>>, Condvar)>,
+}
+
+static TASK_TX: OnceLock<Mutex<Sender<Task>>> = OnceLock::new();
+
+fn ensure_worker() {
+    TASK_TX.get_or_init(|| {
+        let (tx, rx) = channel::<Task>();
+        thread::Builder::new().name("webnn-worker".into()).spawn(move || {
+            for task in rx {
+                let inputs: Vec<(&str, &[u8])> = task.inputs.iter()
+                    .map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+                let r = with_backend(|b| b.run(task.graph_id, &inputs, &task.output_names));
+                let (lock, cvar) = &*task.ticket;
+                *lock.lock().unwrap() = Some(r);
+                cvar.notify_one();
+            }
+        }).unwrap();
+        Mutex::new(tx)
+    });
+}
+
+pub fn dispatch_async(graph_id: usize, inputs: Vec<(String, Vec<u8>)>, output_names: Vec<String>) -> Ticket {
+    ensure_worker();
+    let ticket = Ticket { result: Arc::new((Mutex::new(None), Condvar::new())) };
+    TASK_TX.get().unwrap().lock().unwrap().send(Task { graph_id, inputs, output_names, ticket: ticket.result.clone() }).unwrap();
+    ticket
+}
+
+pub fn flush(ticket: Ticket) -> Result<RunResult, String> { ticket.flush() }
+
 // ── Shared converter: GraphNode[] → GraphInfo ──
 
 fn to_dtype(v: u32) -> RnnDtype {

@@ -9554,7 +9554,6 @@ version = "0.3.0"
 dependencies = [
  "env_logger 0.11.8",
  "log",
- "ort",
  "rustnn",
 ]
 
