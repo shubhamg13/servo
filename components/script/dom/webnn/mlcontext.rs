@@ -104,60 +104,39 @@ impl MLContextMethods<crate::DomTypeHolder> for MLContext {
             let mut webnn_nodes: Vec<webnn::GraphNode> = Vec::new();
             for node in nodes.iter() {
                 webnn_nodes.push(webnn::GraphNode {
-                    op: node.op.clone(),
-                    inputs: node.inputs.clone(),
-                    output: node.output.clone(),
-                    data_type: node.data_type as u32,
-                    shape: node.shape.clone(),
-                    attrs: node.attrs.clone(),
+                    op: node.op.clone(), inputs: node.inputs.clone(),
+                    output: node.output.clone(), data_type: node.data_type as u32,
+                    shape: node.shape.clone(), attrs: node.attrs.clone(),
                     data: node.data.clone(),
                 });
             }
 
             let mut input_data: Vec<(String, Vec<u8>)> = Vec::new();
             for (name, tensor) in inputs.iter() {
-                if let Some(data) = tensor.read_data() {
-                    input_data.push((name.0.clone(), data));
-                }
+                if let Some(data) = tensor.read_data() { input_data.push((name.0.clone(), data)); }
             }
             let input_slices: Vec<(&str, &[u8])> = input_data.iter()
                 .map(|(n, d)| (n.as_str(), d.as_slice())).collect();
 
-            let output_names = graph.output_names();
-            let output_internal_names = graph.output_internal_names();
-            let user_to_internal: std::collections::HashMap<String, String> = output_names.iter()
-                .zip(output_internal_names.iter()).map(|(u, i)| (u.clone(), i.clone())).collect();
-            let internal_names: Vec<String> = outputs.iter()
-                .filter_map(|(k, _)| user_to_internal.get(k.0.as_str()).cloned()).collect();
+            let output_internal_names: Vec<String> = graph.output_internal_names().clone();
+            let output_names: Vec<String> = outputs.iter().map(|(k, _)| k.0.clone()).collect();
 
-            let cache_key: usize = {
-                let mut h: u64 = 0;
-                for node in graph.nodes().iter() {
-                    for b in node.op.as_bytes() { h = h.wrapping_mul(1099511628211).wrapping_add(*b as u64); }
-                    for b in node.output.as_bytes() { h = h.wrapping_mul(1099511628211).wrapping_add(*b as u64); }
-                    for s in &node.shape { h = h.wrapping_mul(1099511628211).wrapping_add(*s as u64); }
-                }
-                h as usize
+            let gid = graph.graph_id();
+            let r = if gid != 0 {
+                webnn::run(gid, &input_slices, &output_internal_names)
+            } else {
+                webnn::compile(&webnn_nodes, &output_internal_names)
+                    .and_then(|gid| webnn::run(gid, &input_slices, &output_internal_names))
             };
-
-            let model_bytes = webnn::compile_cached(&webnn_nodes, &internal_names, cache_key)
-                .map_err(|e| log::error!("WebNN compile: {e}"));
-            if let Ok(b) = model_bytes {
-                if let Ok(result) = webnn::run(&b, &input_slices) {
-                    let mut out_map: std::collections::HashMap<String, Vec<u8>> =
-                        std::collections::HashMap::new();
-                    for (name, data) in internal_names.iter().zip(result.outputs.into_iter()) {
-                        out_map.insert(name.clone(), data);
-                    }
+            match r {
+                Ok(result) => {
                     for (name, out_tensor) in outputs.iter() {
-                        if let Some(iname) = user_to_internal.get(name.0.as_str()) {
-                            if let Some(data) = out_map.remove(iname) {
-                                out_tensor.write_data(&data);
-                            }
-                        }
+                        let idx = output_names.iter().position(|n| n == name.0.as_str()).unwrap_or(0);
+                        if let Some(data) = result.outputs.get(idx) { out_tensor.write_data(data); }
                     }
                     return;
                 }
+                Err(e) => log::error!("WebNN: {e}"),
             }
         }
 
@@ -166,9 +145,7 @@ impl MLContextMethods<crate::DomTypeHolder> for MLContext {
         let first_input = inputs.iter().next();
         if let Some((_, first_tensor)) = first_input {
             if let Some(data) = first_tensor.read_data() {
-                for (_, out_tensor) in outputs.iter() {
-                    out_tensor.write_data(&data);
-                }
+                for (_, out_tensor) in outputs.iter() { out_tensor.write_data(&data); }
             }
         }
     }

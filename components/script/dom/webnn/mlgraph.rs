@@ -48,6 +48,7 @@ pub(crate) struct MLGraph {
     output_names: DomRefCell<Vec<String>>,
     output_internal_names: DomRefCell<Vec<String>>,
     input_operand_info: DomRefCell<HashMap<String, InputOperandInfo>>,
+    graph_id: std::cell::Cell<usize>,
 }
 
 impl MLGraph {
@@ -59,6 +60,7 @@ impl MLGraph {
             output_names: DomRefCell::new(Vec::new()),
             output_internal_names: DomRefCell::new(Vec::new()),
             input_operand_info: DomRefCell::new(HashMap::new()),
+            graph_id: std::cell::Cell::new(0),
         }
     }
 
@@ -95,6 +97,9 @@ impl MLGraph {
     pub(crate) fn new(global: &GlobalScope, can_gc: CanGc) -> DomRoot<MLGraph> {
         reflect_dom_object(Box::new(MLGraph::new_inherited()), global, can_gc)
     }
+
+    pub(crate) fn graph_id(&self) -> usize { self.graph_id.get() }
+    pub(crate) fn set_graph_id(&self, id: usize) { self.graph_id.set(id); }
 }
 
 impl MLGraphMethods<crate::DomTypeHolder> for MLGraph {

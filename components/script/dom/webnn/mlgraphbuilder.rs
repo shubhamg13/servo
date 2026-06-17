@@ -435,6 +435,21 @@ impl MLGraphBuilderMethods<crate::DomTypeHolder> for MLGraphBuilder {
         graph.set_output_internal_names(output_internal_names);
         graph.set_input_operand_info(input_operand_info);
 
+        // Multi-backend: compile via rustnn MLContext
+        {
+            let nodes_for_rnn = self.nodes.borrow().clone();
+            let webnn_nodes: Vec<webnn::GraphNode> = nodes_for_rnn.iter().map(|n| webnn::GraphNode {
+                op: n.op.clone(), inputs: n.inputs.clone(), output: n.output.clone(),
+                data_type: n.data_type as u32, shape: n.shape.clone(),
+                attrs: n.attrs.clone(), data: n.data.clone(),
+            }).collect();
+            let internal_names: Vec<String> = outputs.iter().map(|(_, v)| v.name().to_string()).collect();
+            match webnn::compile(&webnn_nodes, &internal_names) {
+                Ok(gid) => graph.set_graph_id(gid),
+                Err(e) => log::error!("rustnn compile: {e}"),
+            }
+        }
+
         let promise = Promise::new_in_current_realm(comp, can_gc);
         promise.resolve_native(&graph, can_gc);
         Ok(promise)

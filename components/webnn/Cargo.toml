@@ -18,7 +18,6 @@ default = []
 [dependencies]
 log = { workspace = true }
 rustnn = { path = "/home/shubham/space/servo/rustnn", default-features = false, features = ["onnx-runtime"] }
-ort = { version = "=2.0.0-rc.12", features = ["ndarray", "half", "load-dynamic"] }
 
 [dev-dependencies]
 env_logger = "0.11"
