@@ -57,7 +57,7 @@ use js::glue::GetWindowProxyClass;
 use js::jsapi::{GCReason, JSContext as UnsafeJSContext};
 use js::jsval::UndefinedValue;
 use js::rust::ParentRuntime;
-use js::rust::wrappers2::{JS_AddInterruptCallback, JS_GC, SetWindowProxyClass};
+use js::rust::wrappers2::{JS_AddInterruptCallback, JS_GC, JS_MaybeGC, SetWindowProxyClass};
 use layout_api::{LayoutConfig, LayoutFactory, RestyleReason, ScriptThreadFactory};
 use media::WindowGLContext;
 use metrics::MAX_TASK_NS;
@@ -1522,6 +1522,15 @@ impl ScriptThread {
                 .perform_a_dom_garbage_collection_checkpoint();
         }
 
+        // Nudge the JS GC once per event-loop batch so that unreachable DOM
+        // objects (and the backend resources their finalizers release, e.g.
+        // WebNN contexts/graphs/tensors) are collected promptly instead of
+        // waiting for an allocation-triggered GC. `JS_MaybeGC` runs only when
+        // the heap has grown since the last GC, so idle batches are cheap.
+        unsafe {
+            JS_MaybeGC(cx);
+        }
+
         let built_any_display_lists =
             self.needs_rendering_update.load(Ordering::Relaxed) && self.update_the_rendering(cx);
 
@@ -1718,6 +1727,10 @@ impl ScriptThread {
                 #[cfg(feature = "webgpu")]
                 ScriptThreadEventCategory::WebGPUMsg => {
                     time_profile!(ProfilerCategory::ScriptWebGPUMsg, None, profiler_chan, f)
+                },
+                #[cfg(feature = "webnn")]
+                ScriptThreadEventCategory::WebNNMsg => {
+                    time_profile!(ProfilerCategory::ScriptEvent, None, profiler_chan, f)
                 },
             }
         } else {

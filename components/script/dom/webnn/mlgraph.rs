@@ -1,0 +1,179 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+use std::cell::Cell;
+use std::collections::HashMap;
+
+use dom_struct::dom_struct;
+use js::context::JSContext;
+use script_bindings::cell::DomRefCell;
+use script_bindings::reflector::{Reflector, reflect_dom_object};
+
+use crate::dom::bindings::codegen::Bindings::WebNNBinding::{MLGraphMethods, MLOperandDataType};
+use crate::dom::bindings::error::Error;
+use crate::dom::bindings::root::DomRoot;
+use crate::dom::bindings::weakref::WeakRef;
+use crate::dom::globalscope::GlobalScope;
+use crate::dom::promise::RootedPromise;
+use crate::dom::webnn::mlcontext::MLContext;
+use crate::routed_promise::RoutedPromiseListener;
+
+/// Sends `destroy_graph` when the `MLGraph` is garbage collected, so the
+/// backend compiled graph is released even if the page never calls
+/// `graph.destroy()`. Mirrors the WebGPU `Droppable*` pattern.
+#[derive(JSTraceable, MallocSizeOf)]
+struct DroppableMLGraph {
+    #[no_trace]
+    #[ignore_malloc_size_of = "GenericSender"]
+    channel: webnn::WebNN,
+    #[no_trace]
+    context_id: webnn::ContextId,
+    /// Mirrors `MLGraph::graph_id`; 0 means the build never completed.
+    graph_id: Cell<usize>,
+    /// Set once the graph has been destroyed (explicitly or via drop) so a
+    /// redundant `destroy_graph` is not sent.
+    destroyed: Cell<bool>,
+}
+
+impl Drop for DroppableMLGraph {
+    fn drop(&mut self) {
+        if self.destroyed.get() {
+            return;
+        }
+        self.destroyed.set(true);
+        let graph_id = self.graph_id.get();
+        // graph_id 0 is the "not yet built" sentinel; the backend assigns ids
+        // starting at 1, so nothing to release.
+        if graph_id != 0 {
+            self.channel.destroy_graph(self.context_id, graph_id);
+        }
+    }
+}
+
+/// <https://www.w3.org/TR/webnn/#mlgraph>
+#[dom_struct]
+pub(crate) struct MLGraph {
+    reflector_: Reflector,
+    /// <https://www.w3.org/TR/webnn/#dom-mlgraphbuilder-context-slot>
+    context: WeakRef<MLContext>,
+    graph_id: Cell<usize>,
+    /// <https://www.w3.org/TR/webnn/#dom-mlgraph-isdestroyed-slot>
+    is_destroyed: Cell<bool>,
+    /// <https://www.w3.org/TR/webnn/#dom-mlgraph-outputdescriptors-slot>
+    output_descriptors: DomRefCell<HashMap<String, (MLOperandDataType, Vec<u32>)>>,
+    /// Sends `destroy_graph` on GC (see `DroppableMLGraph`).
+    droppable: DroppableMLGraph,
+}
+
+impl MLGraph {
+    pub(crate) fn new_inherited(context: &MLContext) -> MLGraph {
+        MLGraph {
+            reflector_: Reflector::new(),
+            context: WeakRef::new(context),
+            graph_id: Cell::new(0),
+            is_destroyed: Cell::new(false),
+            output_descriptors: DomRefCell::new(HashMap::new()),
+            droppable: DroppableMLGraph {
+                channel: context.channel().clone(),
+                context_id: context.context_id(),
+                graph_id: Cell::new(0),
+                destroyed: Cell::new(false),
+            },
+        }
+    }
+
+    pub(crate) fn new(
+        cx: &mut JSContext,
+        global: &GlobalScope,
+        context: &MLContext,
+    ) -> DomRoot<MLGraph> {
+        reflect_dom_object(cx, Box::new(MLGraph::new_inherited(context)), global)
+    }
+
+    /// <https://www.w3.org/TR/webnn/#dom-mlgraph-context-slot>
+    pub(crate) fn context(&self) -> &WeakRef<MLContext> {
+        &self.context
+    }
+
+    /// <https://www.w3.org/TR/webnn/#dom-mlgraph-isdestroyed-slot>
+    pub(crate) fn is_destroyed(&self) -> bool {
+        self.is_destroyed.get()
+    }
+
+    pub(crate) fn graph_id(&self) -> usize {
+        self.graph_id.get()
+    }
+
+    pub(crate) fn set_graph_id(&self, graph_id: usize) {
+        self.graph_id.set(graph_id);
+        self.droppable.graph_id.set(graph_id);
+    }
+
+    /// <https://www.w3.org/TR/webnn/#dom-mlgraph-outputdescriptors-slot>
+    pub(crate) fn set_output_descriptors(
+        &self,
+        descriptors: HashMap<String, (MLOperandDataType, Vec<u32>)>,
+    ) {
+        *self.output_descriptors.borrow_mut() = descriptors;
+    }
+
+    /// <https://www.w3.org/TR/webnn/#dom-mlgraph-outputdescriptors-slot>
+    #[allow(dead_code)]
+    pub(crate) fn output_descriptors(
+        &self,
+    ) -> std::cell::Ref<'_, HashMap<String, (MLOperandDataType, Vec<u32>)>> {
+        self.output_descriptors.borrow()
+    }
+}
+
+impl MLGraphMethods<crate::DomTypeHolder> for MLGraph {
+    /// <https://www.w3.org/TR/webnn/#dom-mlgraph-destroy>
+    fn Destroy(&self) {
+        // Step 1. If [[isDestroyed]] is true, then return.
+        if self.is_destroyed.get() {
+            return;
+        }
+        // Step 2. Set [[isDestroyed]] to true.
+        self.is_destroyed.set(true);
+        // Mark the GC droppable as destroyed so the Drop hook does not send a
+        // redundant destroy_graph after the explicit destroy().
+        self.droppable.destroyed.set(true);
+        // Step 3. Queue a task on this.[[context]].[[timeline]] to mark
+        // resources owned by this graph as freeable.
+        // Note: We call channel.destroy_graph directly instead of queueing on a
+        // timeline (no per-context timeline exists).
+        if let Some(context) = self.context.root() {
+            context
+                .channel()
+                .destroy_graph(context.context_id(), self.graph_id.get());
+        }
+    }
+}
+
+impl RoutedPromiseListener<crate::DomTypeHolder, webnn::BuildResponse> for MLGraph {
+    fn handle_response(
+        &self,
+        cx: &mut JSContext,
+        response: webnn::BuildResponse,
+        promise: &RootedPromise,
+    ) {
+        // Step 18.2. If aborted, then queue an ML task with global to
+        // reject promise with an "InvalidStateError" DOMException.
+        if let Some(context) = self.context.root() {
+            if context.is_lost() {
+                promise.reject_error(cx, Error::InvalidState(Some("Context is lost.".into())));
+                return;
+            }
+        }
+        match response.graph_id {
+            Ok(graph_id) => {
+                self.set_graph_id(graph_id);
+                promise.resolve_native(cx, self);
+            },
+            Err(message) => {
+                promise.reject_error(cx, Error::Operation(Some(message)));
+            },
+        }
+    }
+}

@@ -112,6 +112,9 @@ webgpu = [
 webnn = [
     "script/webnn",
 ]
+webnn-rustnn = [
+    "script/webnn-rustnn",
+]
 webxr = [
     "webgl",
     "gamepad",

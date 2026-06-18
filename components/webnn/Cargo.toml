@@ -1,0 +1,70 @@
+[package]
+name = "servo-webnn"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[lib]
+name = "webnn"
+
+[features]
+default = []
+rustnn = ["dep:rustnn"]
+
+# `rustnn/coreml-runtime` is enabled on macOS only, because the backend needs a
+# `Send` graph (`CompiledCoremlModel` holds an objc-backed raw pointer) and only
+# Apple hardware can run it. The pinned revision is upstream main — which now
+# carries that fix (rustnn#285) and the LiteRT prebuilt-path fix (rustnn#282) —
+# plus one fork commit pointing litert/litert-sys at the LiteRT 2.2.0 fork, still
+# the only source of the aarch64-unknown-linux-ohos bindings. Drop that commit
+# from the pin once a released litert-sys carries OpenHarmony.
+#
+# Backend selection is not a Servo concern: a build compiles in the backends
+# that exist on its target, and rustnn's backend_selection picks among them
+# from the requested options (the requested device type is forwarded as an
+# explicit hint in rustnn_backend.rs).
+#
+# Per-target backends:
+#   - OpenHarmony: LiteRT (CPU/GPU) + CANN (HiAI NPU). No ONNX Runtime (no
+#     OpenHarmony build) and no CoreML.
+#   - macOS: CoreML (CPU/GPU/Neural Engine). CoreML covers every device class
+#     Apple hardware exposes, and an ONNX Runtime device could not be selected
+#     while the device-type hint pins CoreML, so nothing else is compiled in.
+#   - Windows: ONNX Runtime. Its device classes come from the execution
+#     providers registered with the environment, and the pinned rustnn
+#     registers only the CPU provider, so this is CPU-only for now. LiteRT is
+#     omitted so no prebuilt runtime library has to be located and copied
+#     beside the executable.
+#   - Linux: LiteRT (CPU/GPU) + ONNX Runtime (last-resort fallback).
+
+[dependencies]
+bytemuck = { workspace = true }
+half = { workspace = true, features = ["bytemuck"] }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+servo-base = { workspace = true }
+rustnn = { git = "https://github.com/shubhamg13/rustnn", rev = "64bf833eca5309c047a6938d7f0b9d7e3a8e68dc", default-features = false, optional = true }
+
+# OpenHarmony: LiteRT for CPU/GPU plus CANN for the HiAI NPU. No ONNX Runtime —
+# it has no OpenHarmony build, and this target never compiled it.
+[target.'cfg(target_env = "ohos")'.dependencies]
+rustnn = { git = "https://github.com/shubhamg13/rustnn", rev = "64bf833eca5309c047a6938d7f0b9d7e3a8e68dc", default-features = false, optional = true, features = ["litert-runtime", "cann-runtime"] }
+
+# Linux: LiteRT for CPU/GPU, with ONNX Runtime as the last-resort fallback.
+[target.'cfg(not(any(target_env = "ohos", target_os = "macos", target_os = "windows")))'.dependencies]
+rustnn = { git = "https://github.com/shubhamg13/rustnn", rev = "64bf833eca5309c047a6938d7f0b9d7e3a8e68dc", default-features = false, optional = true, features = ["litert-runtime", "onnx-runtime"] }
+
+# macOS: CoreML only — it covers CPU, the GPU and the Neural Engine.
+[target.'cfg(target_os = "macos")'.dependencies]
+rustnn = { git = "https://github.com/shubhamg13/rustnn", rev = "64bf833eca5309c047a6938d7f0b9d7e3a8e68dc", default-features = false, optional = true, features = ["coreml-runtime"] }
+
+# Windows: ONNX Runtime. `ort` is built with `load-dynamic`, so onnxruntime.dll
+# has to be findable at run time (`ORT_DYLIB_PATH`, or on `PATH`).
+[target.'cfg(target_os = "windows")'.dependencies]
+rustnn = { git = "https://github.com/shubhamg13/rustnn", rev = "64bf833eca5309c047a6938d7f0b9d7e3a8e68dc", default-features = false, optional = true, features = ["onnx-runtime"] }

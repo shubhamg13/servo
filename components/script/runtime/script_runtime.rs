@@ -138,6 +138,8 @@ pub(crate) enum ScriptThreadEventCategory {
     PerformanceTimelineTask,
     #[cfg(feature = "webgpu")]
     WebGPUMsg,
+    #[cfg(feature = "webnn")]
+    WebNNMsg,
 }
 
 impl From<ScriptThreadEventCategory> for ProfilerCategory {
@@ -186,6 +188,8 @@ impl From<ScriptThreadEventCategory> for ProfilerCategory {
             ScriptThreadEventCategory::WorkletEvent => ProfilerCategory::ScriptWorkletEvent,
             #[cfg(feature = "webgpu")]
             ScriptThreadEventCategory::WebGPUMsg => ProfilerCategory::ScriptWebGPUMsg,
+            #[cfg(feature = "webnn")]
+            ScriptThreadEventCategory::WebNNMsg => ProfilerCategory::ScriptEvent,
         }
     }
 }
@@ -236,6 +240,8 @@ impl From<ScriptThreadEventCategory> for ScriptHangAnnotation {
             ScriptThreadEventCategory::PortMessage => ScriptHangAnnotation::PortMessage,
             #[cfg(feature = "webgpu")]
             ScriptThreadEventCategory::WebGPUMsg => ScriptHangAnnotation::WebGPUMsg,
+            #[cfg(feature = "webnn")]
+            ScriptThreadEventCategory::WebNNMsg => ScriptHangAnnotation::WebNNMsg,
         }
     }
 }

@@ -232,9 +232,27 @@ def package_gstreamer_dylibs(binary_path: str, library_target_directory: str, ta
 
     os.makedirs(library_target_directory, exist_ok=True)
     try:
+        # Servo also links components that bring their own runtime search path —
+        # the prebuilt LiteRT runtime, for instance. Their `@rpath` dependencies
+        # are not under the GStreamer root and are not this step's to package;
+        # they are resolved at run time by the rpath that linked them. Absolute
+        # dependencies are copied as they always were.
+        def is_ours_to_package(dependency: str) -> bool:
+            if not dependency.startswith("@rpath/"):
+                return True
+            name = dependency.removeprefix("@rpath/")
+            return any(
+                os.path.exists(os.path.join(gstreamer_root_libs, relative_directory, name))
+                for relative_directory in ["", "..", "gstreamer-1.0"]
+            )
+
         # Collect all the initial binary dependencies for Servo and the plugins that it uses,
         # which are loaded dynamically at runtime and don't appear in `otool` output.
-        binary_dependencies = set(find_non_system_dependencies_with_otool(binary_path))
+        binary_dependencies = {
+            dependency
+            for dependency in find_non_system_dependencies_with_otool(binary_path)
+            if is_ours_to_package(dependency)
+        }
         binary_dependencies.update(
             [os.path.join(gstreamer_root_libs, "gstreamer-1.0", plugin) for plugin in macos_plugins()]
         )

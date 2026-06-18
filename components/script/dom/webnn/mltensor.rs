@@ -1,0 +1,304 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+use std::cell::Cell;
+
+use dom_struct::dom_struct;
+use js::context::JSContext;
+use js::conversions::ToJSValConvertible;
+use js::rust::MutableHandleValue;
+use script_bindings::cell::DomRefCell;
+use script_bindings::reflector::{Reflector, reflect_dom_object};
+use script_bindings::root::DomRoot;
+
+use crate::dom::bindings::codegen::Bindings::WebNNBinding::{MLOperandDataType, MLTensorMethods};
+use crate::dom::bindings::codegen::UnionTypes::MaybeSharedArrayBufferViewOrMaybeSharedArrayBuffer;
+use crate::dom::bindings::weakref::WeakRef;
+use crate::dom::globalscope::GlobalScope;
+use crate::dom::promise::{RootedPromise, TracedPromise};
+use crate::dom::webnn::mlcontext::MLContext;
+
+/// A pending read request queued on a tensor.
+#[derive(JSTraceable)]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
+pub(crate) enum PendingRead {
+    /// A normal `readTensor()` request; resolve the promise with the returned
+    /// bytes.
+    Read(TracedPromise),
+    /// A BYOB overload; write the returned bytes into `output` and resolve
+    /// `promise` with `undefined`.
+    ReadByob {
+        promise: TracedPromise,
+        output: MaybeSharedArrayBufferViewOrMaybeSharedArrayBuffer,
+    },
+}
+
+/// Sends `destroy_tensor` when the `MLTensor` is garbage collected, so the
+/// backend device tensor is released even if the page never calls `destroy()`.
+/// Mirrors the WebGPU `DroppableGPUTexture`/`DroppableGPUBuffer` pattern.
+#[derive(JSTraceable, MallocSizeOf)]
+struct DroppableMLTensor {
+    #[no_trace]
+    #[ignore_malloc_size_of = "GenericSender"]
+    channel: webnn::WebNN,
+    #[no_trace]
+    context_id: webnn::ContextId,
+    tensor_id: u32,
+    /// Set once the tensor has been released (explicitly or via drop) so a
+    /// redundant `destroy_tensor` is not sent.
+    destroyed: Cell<bool>,
+}
+
+impl Drop for DroppableMLTensor {
+    fn drop(&mut self) {
+        if self.destroyed.get() {
+            return;
+        }
+        self.destroyed.set(true);
+        self.channel.destroy_tensor(self.context_id, self.tensor_id);
+    }
+}
+
+/// <https://www.w3.org/TR/webnn/#mltensor>
+#[dom_struct]
+pub(crate) struct MLTensor {
+    reflector_: Reflector,
+    /// <https://www.w3.org/TR/webnn/#dom-mlgraphbuilder-context-slot>
+    context: WeakRef<MLContext>,
+    /// <https://www.w3.org/TR/webnn/#dom-mloperanddescriptor-datatype>
+    data_type: MLOperandDataType,
+    /// <https://www.w3.org/TR/webnn/#dom-mloperanddescriptor-shape>
+    shape: Vec<u32>,
+    /// <https://www.w3.org/TR/webnn/#dom-mltensordescriptor-readable>
+    readable: bool,
+    /// <https://www.w3.org/TR/webnn/#dom-mltensordescriptor-writable>
+    writable: bool,
+    /// <https://www.w3.org/TR/webnn/#dom-mltensor-isconstant-slot>
+    is_constant: bool,
+    /// <https://www.w3.org/TR/webnn/#dom-mltensor-isdestroyed-slot>
+    is_destroyed: Cell<bool>,
+    /// Script-visible tensor id assigned by the context (0 means no backend id).
+    tensor_id: Cell<u32>,
+    /// Number of in-flight dispatches writing to this tensor.
+    pending_dispatches: Cell<u32>,
+    /// Read requests waiting for in-flight dispatches to complete.
+    #[ignore_malloc_size_of = "Promise; ArrayBufferView"]
+    pending_reads: DomRefCell<Vec<PendingRead>>,
+    /// Whether a backend read is already in flight for this tensor.
+    read_in_flight: Cell<bool>,
+    /// Sends `destroy_tensor` on GC (see `DroppableMLTensor`).
+    droppable: DroppableMLTensor,
+}
+
+impl MLTensor {
+    pub(crate) fn new_inherited(
+        context: &MLContext,
+        data_type: MLOperandDataType,
+        shape: Vec<u32>,
+        readable: bool,
+        writable: bool,
+        is_constant: bool,
+        tensor_id: u32,
+    ) -> MLTensor {
+        MLTensor {
+            reflector_: Reflector::new(),
+            context: WeakRef::new(context),
+            data_type,
+            shape,
+            readable,
+            writable,
+            is_constant,
+            is_destroyed: Cell::new(false),
+            tensor_id: Cell::new(tensor_id),
+            pending_dispatches: Cell::new(0),
+            pending_reads: DomRefCell::new(Vec::new()),
+            read_in_flight: Cell::new(false),
+            droppable: DroppableMLTensor {
+                channel: context.channel().clone(),
+                context_id: context.context_id(),
+                tensor_id,
+                destroyed: Cell::new(false),
+            },
+        }
+    }
+
+    pub(crate) fn new(
+        cx: &mut JSContext,
+        global: &GlobalScope,
+        context: &MLContext,
+        data_type: MLOperandDataType,
+        shape: Vec<u32>,
+        readable: bool,
+        writable: bool,
+        is_constant: bool,
+        tensor_id: u32,
+    ) -> DomRoot<MLTensor> {
+        reflect_dom_object(
+            cx,
+            Box::new(MLTensor::new_inherited(
+                context,
+                data_type,
+                shape,
+                readable,
+                writable,
+                is_constant,
+                tensor_id,
+            )),
+            global,
+        )
+    }
+
+    /// Script-visible tensor id assigned by the context (0 means no backend id).
+    pub(crate) fn tensor_id(&self) -> u32 {
+        self.tensor_id.get()
+    }
+
+    /// Number of dispatches currently writing to this tensor.
+    pub(crate) fn pending_dispatches(&self) -> u32 {
+        self.pending_dispatches.get()
+    }
+
+    /// Increments the count of in-flight dispatches writing to this tensor.
+    pub(crate) fn incr_pending_dispatches(&self) {
+        self.pending_dispatches
+            .set(self.pending_dispatches.get() + 1);
+    }
+
+    /// Decrements the count of in-flight dispatches writing to this tensor and
+    /// returns the new count.
+    pub(crate) fn decr_pending_dispatches(&self) -> u32 {
+        let count = self.pending_dispatches.get().saturating_sub(1);
+        self.pending_dispatches.set(count);
+        count
+    }
+
+    /// Appends a normal (non-BYOB) read request to the queue.
+    pub(crate) fn append_read(&self, promise: RootedPromise) {
+        self.pending_reads
+            .borrow_mut()
+            .push(PendingRead::Read(promise.to_traced()));
+    }
+
+    /// Appends a BYOB read request along with its output buffer.
+    pub(crate) fn append_read_byob(
+        &self,
+        promise: RootedPromise,
+        output: MaybeSharedArrayBufferViewOrMaybeSharedArrayBuffer,
+    ) {
+        self.pending_reads
+            .borrow_mut()
+            .push(PendingRead::ReadByob {
+                promise: promise.to_traced(),
+                output,
+            });
+    }
+
+    /// Removes and returns all queued read requests.
+    pub(crate) fn take_pending_reads(&self) -> Vec<PendingRead> {
+        self.pending_reads.borrow_mut().drain(..).collect()
+    }
+
+    /// Whether there are any queued read requests.
+    pub(crate) fn has_pending_reads(&self) -> bool {
+        !self.pending_reads.borrow().is_empty()
+    }
+
+    /// Whether a backend read is already in flight for this tensor.
+    pub(crate) fn read_in_flight(&self) -> bool {
+        self.read_in_flight.get()
+    }
+
+    /// Marks whether a backend read is in flight for this tensor.
+    pub(crate) fn set_read_in_flight(&self, in_flight: bool) {
+        self.read_in_flight.set(in_flight);
+    }
+
+    pub(crate) fn data_type(&self) -> MLOperandDataType {
+        self.data_type
+    }
+
+    pub(crate) fn shape(&self) -> &[u32] {
+        &self.shape
+    }
+
+    pub(crate) fn context(&self) -> &WeakRef<MLContext> {
+        &self.context
+    }
+
+    /// <https://www.w3.org/TR/webnn/#dom-mltensor-isdestroyed-slot>
+    pub(crate) fn is_destroyed(&self) -> bool {
+        self.is_destroyed.get()
+    }
+
+    /// <https://www.w3.org/TR/webnn/#dom-mltensor-isconstant-slot>
+    pub(crate) fn is_constant(&self) -> bool {
+        self.is_constant
+    }
+
+    /// <https://www.w3.org/TR/webnn/#dom-mltensordescriptor-readable>
+    pub(crate) fn readable(&self) -> bool {
+        self.readable
+    }
+
+    /// <https://www.w3.org/TR/webnn/#dom-mltensordescriptor-writable>
+    pub(crate) fn writable(&self) -> bool {
+        self.writable
+    }
+}
+
+impl MLTensorMethods<crate::DomTypeHolder> for MLTensor {
+    /// <https://www.w3.org/TR/webnn/#dom-mltensor-datatype>
+    fn DataType(&self) -> MLOperandDataType {
+        // > The dataType getter steps are to return this’s dataType.
+        self.data_type
+    }
+
+    /// <https://www.w3.org/TR/webnn/#dom-mltensor-destroy>
+    fn Destroy(&self) {
+        // Step 1. Set this.[[isDestroyed]] to true.
+        self.is_destroyed.set(true);
+        // Mark the GC droppable as destroyed so the Drop hook does not send a
+        // redundant destroy_tensor after the explicit destroy().
+        self.droppable.destroyed.set(true);
+        // TODO Step 2. For each promise in this.[[pendingPromises]]:
+        // TODO Step 2.1. Remove promise from this.[[pendingPromises]].
+        // TODO Step 2.2. Reject promise with an "InvalidStateError" DOMException.
+        // Step 3. Enqueue the following steps to this.[[context]].[[timeline]]:
+        // Step 3.1. Release this.[[data]].
+        if let Some(context) = self.context.root() {
+            context
+                .channel()
+                .destroy_tensor(context.context_id(), self.tensor_id());
+        }
+    }
+
+    /// <https://www.w3.org/TR/webnn/#dom-mltensor-shape>
+    fn Shape(&self, cx: &mut JSContext, retval: MutableHandleValue) {
+        // > The shape getter steps are to return this’s shape.
+        let js_shape: Vec<f64> = self
+            .shape
+            .iter()
+            .map(|&dimension| dimension as f64)
+            .collect();
+        js_shape.to_jsval(cx, retval)
+    }
+
+    /// <https://www.w3.org/TR/webnn/#dom-mltensor-readable>
+    fn Readable(&self) -> bool {
+        // > The readable getter steps are to return this.[[descriptor]].readable.
+        self.readable
+    }
+
+    /// <https://www.w3.org/TR/webnn/#dom-mltensor-writable>
+    fn Writable(&self) -> bool {
+        // > The writable getter steps are to return this.[[descriptor]].writable.
+        self.writable
+    }
+
+    /// <https://www.w3.org/TR/webnn/#dom-mltensor-constant>
+    fn Constant(&self) -> bool {
+        // > The constant getter steps are to return this’s [[isConstant]].
+        self.is_constant
+    }
+}

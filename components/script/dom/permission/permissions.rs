@@ -396,6 +396,7 @@ impl Convert<PermissionFeature> for PermissionName {
                 PermissionFeature::ScreenWakeLock(WakeLockType::Screen)
             },
             PermissionName::Gamepad => PermissionFeature::Gamepad,
+            PermissionName::WebNN => PermissionFeature::WebNN,
         }
     }
 }

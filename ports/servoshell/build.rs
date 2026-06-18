@@ -5,7 +5,7 @@
 use std::error::Error;
 use std::fs::File;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn git_sha() -> Result<String, String> {
@@ -86,6 +86,38 @@ fn main() -> Result<(), Box<dyn Error>> {
     // linker to locate them. See `man dyld` for more info.
     if target_os == "macos" {
         println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/lib/");
+    }
+
+    // The prebuilt LiteRT runtime is linked by `litert-sys`, which sets an rpath
+    // for its own targets. Cargo does not propagate a dependency's
+    // `rustc-link-arg` to this binary, so the final artifact needs one itself.
+    // `LITERT_LIB_DIR` is litert-sys's own override for the directory holding
+    // the prebuilt, so pointing at it cannot disagree with what was linked.
+    // Linux is the only target that builds WebNN with LiteRT: OpenHarmony loads
+    // the runtime from the application's own library directory, which is already
+    // on the loader's search path, and macOS and Windows build it with CoreML
+    // and ONNX Runtime instead.
+    if target_env != "ohos" &&
+        target_os != "macos" &&
+        target_os != "windows" &&
+        std::env::var("CARGO_FEATURE_WEBNN_RUSTNN").is_ok()
+    {
+        println!("cargo:rerun-if-env-changed=LITERT_LIB_DIR");
+        match std::env::var_os("LITERT_LIB_DIR").map(PathBuf::from) {
+            Some(dir) if dir.is_dir() => {
+                println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir.display());
+            },
+            Some(dir) => println!(
+                "cargo:warning=LITERT_LIB_DIR is `{}`, which is not a directory, so the prebuilt \
+                 LiteRT runtime that this build links will not be findable at run time.",
+                dir.display()
+            ),
+            None => println!(
+                "cargo:warning=LITERT_LIB_DIR is not set, so the prebuilt LiteRT runtime that this \
+                 build links will only be found if the platform's library search path provides it \
+                 when Servo runs. Set LITERT_LIB_DIR to the directory holding that runtime."
+            ),
+        }
     }
 
     // On OpenHarmony, libservoshell.so is loaded by ArkTS as a NAPI module.
