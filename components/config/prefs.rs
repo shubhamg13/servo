@@ -503,7 +503,7 @@ impl Preferences {
             dom_webgl2_enabled: false,
             dom_webgpu_enabled: false,
             dom_webgpu_wgpu_backend: String::new(),
-            dom_webnn_enabled: false,
+            dom_webnn_enabled: true,
             dom_webrtc_enabled: false,
             dom_webrtc_transceiver_enabled: false,
             dom_webxr_enabled: true,

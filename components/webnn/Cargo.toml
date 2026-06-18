@@ -1,0 +1,26 @@
+[package]
+name = "servo-webnn"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[lib]
+name = "webnn"
+
+[features]
+default = []
+rustnn = ["dep:rustnn", "rustnn/onnx-runtime"]
+cann = ["dep:rustnn", "rustnn/cann-runtime"]
+
+[dependencies]
+bytemuck = { workspace = true }
+half = { workspace = true, features = ["bytemuck"] }
+log = { workspace = true }
+serde = { workspace = true }
+servo-base = { workspace = true }
+rustnn = { path = "../../../../rustnn", default-features = false, optional = true }

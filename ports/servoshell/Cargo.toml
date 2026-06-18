@@ -73,6 +73,8 @@ webgl_backtrace = ["servo/webgl_backtrace"]
 webgl = ["servo/webgl"]
 webgpu = ["servo/webgpu"]
 webnn = ["servo/webnn"]
+webnn-rustnn = ["servo/webnn-rustnn"]
+webnn-cann = ["servo/webnn-cann"]
 webxr = ["servo/webxr"]
 
 [dependencies]
