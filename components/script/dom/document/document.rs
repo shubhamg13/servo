@@ -5631,20 +5631,27 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
 
     /// <https://dom.spec.whatwg.org/#dom-document-adoptnode>
     fn AdoptNode(&self, cx: &mut JSContext, node: &Node) -> Fallible<DomRoot<Node>> {
-        // Step 1.
+        // Step 1. If node is a document, then throw a "NotSupportedError" DOMException.
         if node.is::<Document>() {
             return Err(Error::NotSupported(None));
         }
 
-        // Step 2.
+        // Step 2. If node is a shadow root, then throw a "HierarchyRequestError" DOMException.
         if node.is::<ShadowRoot>() {
             return Err(Error::HierarchyRequest(None));
         }
 
-        // Step 3.
+        // Step 3. If node is a DocumentFragment node whose host is non-null, then return.
+        if let Some(fragment) = node.downcast::<DocumentFragment>() {
+            if fragment.host().is_some() {
+                return Ok(DomRoot::from_ref(node));
+            }
+        }
+
+        // Step 4. Adopt node into this.
         Node::adopt(cx, node, self);
 
-        // Step 4.
+        // Step 5. Return node.
         Ok(DomRoot::from_ref(node))
     }
 
