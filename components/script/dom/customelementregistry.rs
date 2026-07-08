@@ -957,21 +957,21 @@ pub(crate) fn upgrade_element(
     definition: Rc<CustomElementDefinition>,
     element: &Element,
 ) {
-    // Step 1. If element's custom element state is not "undefined" or "uncustomized", then return.
+    // Step 1. If element’s custom element state is not "undefined" or "uncustomized", then return.
     let state = element.get_custom_element_state();
     if state != CustomElementState::Undefined && state != CustomElementState::Uncustomized {
         return;
     }
 
-    // Step 2. Set element's custom element definition to definition.
+    // Step 2. Set element’s custom element definition to definition.
     element.set_custom_element_definition(Rc::clone(&definition));
 
-    // Step 3. Set element's custom element state to "failed".
+    // Step 3. Set element’s custom element state to "failed".
     element.set_custom_element_state(CustomElementState::Failed);
 
-    // Step 4. For each attribute in element's attribute list, in order, enqueue a custom element callback reaction
-    // with element, callback name "attributeChangedCallback", and « attribute's local name, null, attribute's value,
-    // attribute's namespace ».
+    // Step 4. For each attribute in element’s attribute list, in order, enqueue a custom element
+    //    callback reaction with element, callback name "attributeChangedCallback", and
+    //    « attribute’s local name, null, attribute’s value, attribute’s namespace ».
     let custom_element_reaction_stack = ScriptThread::custom_element_reaction_stack();
     for attr in element.attrs().borrow().iter() {
         let local_name = attr.local_name().clone();
@@ -985,7 +985,7 @@ pub(crate) fn upgrade_element(
     }
 
     // Step 5. If element is connected, then enqueue a custom element callback reaction with element,
-    // callback name "connectedCallback", and « ».
+    //    callback name "connectedCallback", and « ».
     if element.is_connected() {
         custom_element_reaction_stack.enqueue_callback_reaction(
             cx,
@@ -995,27 +995,41 @@ pub(crate) fn upgrade_element(
         );
     }
 
-    // Step 6. Add element to the end of definition's construction stack.
+    // Step 6. Add element to the end of definition’s construction stack.
+    //         Let C be definition’s constructor.
+    //         Set the surrounding agent’s active custom element constructor map[C] to element’s
+    //         custom element registry.
     definition
         .construction_stack
         .borrow_mut()
         .push(ConstructionStackEntry::Element(DomRoot::from_ref(element)));
 
-    // Steps 7-8, successful case
+    // Step 7. Run the following steps while catching any exceptions:
+    //    7.1. If definition’s disable shadow is true and element’s shadow root is non-null,
+    //         then throw a "NotSupportedError" DOMException.
+    //    7.2. Set element’s custom element state to "precustomized".
+    //    7.3. Let constructResult be the result of constructing C, with no arguments.
+    //    7.4. If SameValue(constructResult, element) is false, then throw a TypeError.
     let result = run_upgrade_constructor(cx, &definition, element);
 
-    // "regardless of whether the above steps threw an exception" step
+    // Step 8. Then, perform the following steps, regardless of whether the above steps threw an
+    //         exception or not:
+    //    8.1. Remove the surrounding agent’s active custom element constructor map[C].
+    //         (handled within run_upgrade_constructor)
+    //    8.2. Remove the last entry from the end of definition’s construction stack.
     definition.construction_stack.borrow_mut().pop();
 
-    // Step 8 exception handling
+    // Step 9. Finally, if the above steps threw an exception:
     if let Err(error) = result {
-        // Step 8.exception.1
+        // Step 9.1. Set element’s custom element definition to null.
         element.clear_custom_element_definition();
 
-        // Step 8.exception.2
+        // Step 9.2. Empty element’s custom element reaction queue.
         element.clear_reaction_queue();
 
-        // Step 8.exception.3
+        // Step 9.3. Rethrow the exception (thus terminating this algorithm).
+        //       If the above steps threw an exception, then element’s custom element state
+        //       will remain "failed" or "precustomized".
         let global = GlobalScope::current().expect("No current global");
 
         let mut realm = enter_auto_realm(cx, &*global);
@@ -1027,35 +1041,35 @@ pub(crate) fn upgrade_element(
         return;
     }
 
-    // Step 9: handle with form-associated custom element
+    // Step 10. If element is a form-associated custom element:
     if let Some(html_element) = element.downcast::<HTMLElement>() &&
         html_element.is_form_associated_custom_element()
     {
-        // We know this element is is form-associated, so we can use the implementation of
-        // `FormControl` for HTMLElement, which makes that assumption.
-        // Step 9.1: Reset the form owner of element
+        // Step 10.1. Reset the form owner of element. If element is associated with a form element,
+        //       then enqueue a custom element callback reaction with element, callback name
+        //       "formAssociatedCallback", and « the associated form ».
         html_element.reset_form_owner(cx);
         if let Some(form) = html_element.form_owner() {
-            // Even though the tree hasn't structurally mutated,
+            // Even though the tree hasn’t structurally mutated,
             // HTMLCollections need to be invalidated.
             form.upcast::<Node>().rev_version();
             // The spec tells us specifically to enqueue a formAssociated reaction
             // here, but it also says to do that for resetting form owner in general,
-            // and we don't need two reactions.
+            // and we don’t need two reactions.
         }
 
         // Either enabled_state or disabled_state needs to be set,
         // and the possibility of a disabled fieldset ancestor needs
         // to be accounted for. (In the spec, being disabled is
-        // a fact that's true or false about a node at a given time,
+        // a fact that’s true or false about a node at a given time,
         // not a flag that belongs to the node and is updated,
-        // so it doesn't describe this check as an action.)
+        // so it doesn’t describe this check as an action.)
         element.check_disabled_attribute();
         element.check_ancestors_disabled_state_for_form_control();
         element.update_read_write_state_from_readonly_attribute();
 
-        // Step 9.2: If element is disabled, then enqueue a custom element callback reaction
-        // with element.
+        // Step 10.2. If element is disabled, then enqueue a custom element callback reaction with
+        //       element, callback name "formDisabledCallback", and « true ».
         if element.disabled_state() {
             custom_element_reaction_stack.enqueue_callback_reaction(
                 cx,
@@ -1066,12 +1080,12 @@ pub(crate) fn upgrade_element(
         }
     }
 
-    // Step 10
+    // Step 11. Set element’s custom element state to "custom".
     element.set_custom_element_state(CustomElementState::Custom);
 }
 
 /// <https://html.spec.whatwg.org/multipage/#concept-upgrade-an-element>
-/// Steps 9.1-9.4
+/// Implements Step 7 sub-steps.
 #[expect(unsafe_code)]
 fn run_upgrade_constructor(
     cx: &mut JSContext,
@@ -1085,8 +1099,8 @@ fn run_upgrade_constructor(
     element.safe_to_jsval(cx, element_val.handle_mut());
     rooted!(&in(cx) let mut construct_result = ptr::null_mut::<JSObject>());
     {
-        // Step 9.1. If definition's disable shadow is true and element's shadow root is non-null,
-        // then throw a "NotSupportedError" DOMException.
+        // Step 7.1. If definition’s disable shadow is true and element’s shadow root is
+        //           non-null, then throw a "NotSupportedError" DOMException.
         if definition.disable_shadow && element.is_shadow_host() {
             return Err(Error::NotSupported(None));
         }
@@ -1096,10 +1110,10 @@ fn run_upgrade_constructor(
         let cx = &mut *realm;
 
         let args = HandleValueArray::empty();
-        // Step 8.2. Set element's custom element state to "precustomized".
+        // Step 7.2. Set element’s custom element state to "precustomized".
         element.set_custom_element_state(CustomElementState::Precustomized);
 
-        // Step 9.3. Let constructResult be the result of constructing C, with no arguments.
+        // Step 7.3. Let constructResult be the result of constructing C, with no arguments.
         // https://webidl.spec.whatwg.org/#construct-a-callback-function
         run_a_script::<DomTypeHolder, _, _>(cx, window.upcast(), |cx| {
             run_a_callback::<DomTypeHolder, _>(window.upcast(), || {
@@ -1121,7 +1135,7 @@ fn run_upgrade_constructor(
         let mut same = false;
         rooted!(&in(cx) let construct_result_val = ObjectValue(construct_result.get()));
 
-        // Step 9.4. If SameValue(constructResult, element) is false, then throw a TypeError.
+        // Step 7.4. If SameValue(constructResult, element) is false, then throw a TypeError.
         if unsafe {
             !SameValue(
                 cx,

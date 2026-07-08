@@ -129,36 +129,46 @@ fn create_html_element(
 ) -> DomRoot<Element> {
     assert_eq!(name.ns, ns!(html));
 
-    // Step 2. If registry is "default", then set registry
-    // to the result of looking up a custom element registry given document.
+    // Step 1. Let result be null.
+
+    // Step 2. If registry is "default", then set registry to the result of looking up a
+    //         custom element registry given document.
     // TODO: We don't pass in any other value than "default" atm
     let registry = CustomElementRegistry::lookup_a_custom_element_registry(document.upcast());
 
-    // Step 3. Let definition be the result of looking up a custom element
-    // definition given document, namespace, localName, and is.
-    let definition = document.lookup_custom_element_definition(&name.ns, &name.local, is.as_ref());
+    // Step 3. Let definition be the result of looking up a custom element definition given
+    //         registry, namespace, localName, and is.
+    let definition = registry.as_ref().and_then(|r| {
+        if *name.ns == ns!(html) {
+            r.lookup_definition(&name.local, is.as_ref())
+        } else {
+            None
+        }
+    });
 
-    // Step 4. If definition is non-null...
+    // Step 4. If definition is non-null, and definition’s name is not equal to its local
+    //         name (i.e., definition represents a customized built-in element):
     if let Some(definition) = definition {
-        // ...and definition’s name is not equal to its local name
-        // (i.e., definition represents a customized built-in element):
         if !definition.is_autonomous() {
             // Step 4.1. Let interface be the element interface for localName and the HTML namespace.
             // Step 4.2. Set result to the result of creating an element internal given document,
-            // interface, localName, the HTML namespace, prefix, "undefined", is, and registry.
+            //          interface, localName, the HTML namespace, prefix, "undefined", is, and registry.
             let element = create_native_html_element(cx, name, prefix, document, creator, proto);
             element.set_is(definition.name.clone());
             element.set_custom_element_state(CustomElementState::Undefined);
             element.set_custom_element_registry(registry.as_deref());
 
             match mode {
-                // Step 4.3. If synchronousCustomElements is true, then run this step while catching any exceptions:
+                // Step 4.3. If synchronousCustomElements is true, then run this step while
+                //          catching any exceptions:
                 CustomElementCreationMode::Synchronous => {
                     // Step 4.3.1. Upgrade result using definition.
+                    // upgrade_element handles exception reporting and sets state to
+                    // "failed" or "precustomized" if the constructor throws.
                     upgrade_element(cx, definition, &element);
-                    // TODO: "If this step threw an exception exception:" steps.
                 },
-                // Step 4.4. Otherwise, enqueue a custom element upgrade reaction given result and definition.
+                // Step 4.4. Otherwise, enqueue a custom element upgrade reaction given result
+                //          and definition.
                 CustomElementCreationMode::Asynchronous => {
                     ScriptThread::enqueue_upgrade_reaction(cx, &element, definition)
                 },
@@ -167,12 +177,34 @@ fn create_html_element(
         } else {
             // Step 5. Otherwise, if definition is non-null:
             match mode {
-                // Step 5.1. If synchronousCustomElements is true, then run these
-                // steps while catching any exceptions:
+                // Step 5.1. If synchronousCustomElements is true:
                 CustomElementCreationMode::Synchronous => {
                     let local_name = name.local;
+                    // Step 5.1.1. Let C be definition’s constructor.
+                    // Step 5.1.2. Set the surrounding agent’s active custom element constructor
+                    //            map[C] to registry.
+                    // Step 5.1.3. Run these steps while catching any exceptions:
+                    //   5.1.3.1. Set result to the result of constructing C, with no arguments.
+                    //   5.1.3.2. Assert: result’s custom element state and custom element
+                    //            definition are initialized.
+                    //   5.1.3.3. Assert: result’s namespace is the HTML namespace.
+                    //   5.1.3.4. If result’s attribute list is not empty, then throw a
+                    //            "NotSupportedError" DOMException.
+                    //   5.1.3.5. If result has children, then throw a "NotSupportedError"
+                    //            DOMException.
+                    //   5.1.3.6. If result’s parent is non-null, then throw a
+                    //            "NotSupportedError" DOMException.
+                    //   5.1.3.7. If result’s node document is not document, then throw a
+                    //            "NotSupportedError" DOMException.
+                    //   5.1.3.8. If result’s local name is not equal to localName, then
+                    //            throw a "NotSupportedError" DOMException.
+                    //   5.1.3.9. Set result’s namespace prefix to prefix.
+                    //   5.1.3.10. Set result’s is value to null.
+                    //   5.1.3.11. Set result’s custom element registry to registry.
+                    // Step 5.1.5. Remove the surrounding agent\u2019s active custom element
+                    //            constructor map[C].
+                    // (handled within definition.create_element)
                     // TODO(jdm) Pass proto to create_element?
-                    // Steps 4.1.1-4.1.11
                     return match definition.create_element(
                         cx,
                         document,
@@ -184,20 +216,22 @@ fn create_html_element(
                             element
                         },
                         Err(error) => {
-                            // If any of these steps threw an exception exception:
+                            // Step 5.1.4. If any of these steps threw an exception exception:
+                            //   5.1.4.1. Report exception for definition’s constructor’s
+                            //            corresponding JavaScript object’s associated realm’s
+                            //            global object.
                             let global =
                                 GlobalScope::current().unwrap_or_else(|| document.global());
 
                             let mut realm = enter_auto_realm(cx, &*global);
                             let cx = &mut realm.current_realm();
 
-                            // Substep 1. Report exception for definition’s constructor’s corresponding
-                            // JavaScript object’s associated realm’s global object.
                             throw_dom_exception(cx, &global, error);
                             report_pending_exception(cx);
 
-                            // Substep 2. Set result to the result of creating an element internal given document,
-                            // HTMLUnknownElement, localName, the HTML namespace, prefix, "failed", null, and registry.
+                            //   5.1.4.2. Set result to the result of creating an element internal
+                            //            given document, HTMLUnknownElement, localName, the HTML
+                            //            namespace, prefix, "failed", null, and registry.
                             let element = DomRoot::upcast::<Element>(HTMLUnknownElement::new(
                                 cx, local_name, prefix, document, proto,
                             ));
@@ -207,19 +241,18 @@ fn create_html_element(
                         },
                     };
                 },
-                // Step 4.2. Otherwise:
+                // Step 5.2. Otherwise:
                 CustomElementCreationMode::Asynchronous => {
-                    // Step 4.2.1. Set result to a new element that implements the HTMLElement interface,
-                    // with no attributes, namespace set to the HTML namespace, namespace prefix set to
-                    // prefix, local name set to localName, custom element state set to "undefined",
-                    // custom element definition set to null, is value set to null, and node document
-                    // set to document.
+                    // Step 5.2.1. Set result to the result of creating an element internal given
+                    //            document, HTMLElement, localName, the HTML namespace, prefix,
+                    //            "undefined", null, and registry.
                     let result = DomRoot::upcast::<Element>(HTMLElement::new(
                         cx, name.local, prefix, document, proto,
                     ));
                     result.set_custom_element_state(CustomElementState::Undefined);
                     result.set_custom_element_registry(registry.as_deref());
-                    // Step 4.2.2. Enqueue a custom element upgrade reaction given result and definition.
+                    // Step 5.2.2. Enqueue a custom element upgrade reaction given result and
+                    //            definition.
                     ScriptThread::enqueue_upgrade_reaction(cx, &result, definition);
                     return result;
                 },
@@ -227,15 +260,14 @@ fn create_html_element(
         }
     }
 
-    // Step 5. Otherwise:
-    // Step 5.1. Let interface be the element interface for localName and namespace.
-    // Step 5.2. Set result to a new element that implements interface, with no attributes,
-    // namespace set to namespace, namespace prefix set to prefix, local name set to localName,
-    // custom element state set to "uncustomized", custom element definition set to null,
-    // is value set to is, and node document set to document.
+    // Step 6. Otherwise:
+    // Step 6.1. Let interface be the element interface for localName and namespace.
+    // Step 6.2. Set result to the result of creating an element internal given document,
+    //          interface, localName, namespace, prefix, "uncustomized", is, and registry.
     let result = create_native_html_element(cx, name.clone(), prefix, document, creator, proto);
-    // Step 5.3. If namespace is the HTML namespace, and either localName is a valid custom element name or
-    // is is non-null, then set result’s custom element state to "undefined".
+    // Step 6.3. If namespace is the HTML namespace, and either localName is a valid custom
+    //          element name or is is non-null, then set result’s custom element state to
+    //          "undefined".
     match is {
         Some(is) => {
             result.set_is(is);
@@ -254,7 +286,7 @@ fn create_html_element(
         },
     };
 
-    // Step 6. Return result.
+    // Step 7. Return result.
     result
 }
 
