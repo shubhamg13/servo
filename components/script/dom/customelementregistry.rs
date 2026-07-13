@@ -139,17 +139,33 @@ impl CustomElementRegistry {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#look-up-a-custom-element-definition>
-    pub(crate) fn lookup_definition(
-        &self,
+    pub(crate) fn lookup_custom_element_definition(
+        registry: Option<&CustomElementRegistry>,
+        namespace: &Namespace,
         local_name: &LocalName,
         is: Option<&LocalName>,
     ) -> Option<Rc<CustomElementDefinition>> {
-        self.definitions
+        // Step 1. If registry is null, then return null.
+        let registry = registry?;
+
+        // Step 2. If namespace is not the HTML namespace, then return null.
+        if *namespace != ns!(html) {
+            return None;
+        }
+
+        // Step 3. If registry's custom element definition set contains an item
+        //         with name and local name both equal to localName, then return
+        //         that item.
+        // Step 4. If registry's custom element definition set contains an item
+        //         with name equal to is and local name equal to localName, then
+        //         return that item.
+        // Step 5. Return null.
+        registry
+            .definitions
             .borrow()
             .0
             .values()
             .find(|definition| {
-                // Step 4-5
                 definition.local_name == *local_name &&
                     (definition.name == *local_name || Some(&definition.name) == is)
             })
@@ -1157,17 +1173,17 @@ fn run_upgrade_constructor(
 
 /// <https://html.spec.whatwg.org/multipage/#concept-try-upgrade>
 pub(crate) fn try_upgrade_element(cx: &JSContext, element: &Element) {
-    // Step 1. Let definition be the result of looking up a custom element definition given element's node document,
-    // element's namespace, element's local name, and element's is value.
-    let document = element.owner_document();
-    let namespace = element.namespace();
-    let local_name = element.local_name();
-    let is = element.get_is();
-    if let Some(definition) =
-        document.lookup_custom_element_definition(namespace, local_name, is.as_ref())
-    {
-        // Step 2. If definition is not null, then enqueue a custom element upgrade reaction given
-        // element and definition.
+    // Step 1. Let definition be the result of looking up a custom element
+    //         definition given element's custom element registry, element's
+    //         namespace, element's local name, and element's is value.
+    if let Some(definition) = CustomElementRegistry::lookup_custom_element_definition(
+        element.custom_element_registry().as_deref(),
+        element.namespace(),
+        element.local_name(),
+        element.get_is().as_ref(),
+    ) {
+        // Step 2. If definition is not null, then enqueue a custom element
+        //         upgrade reaction given element and definition.
         ScriptThread::enqueue_upgrade_reaction(cx, element, definition);
     }
 }

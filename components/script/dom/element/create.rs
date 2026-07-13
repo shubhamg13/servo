@@ -138,13 +138,12 @@ fn create_html_element(
 
     // Step 3. Let definition be the result of looking up a custom element definition given
     //         registry, namespace, localName, and is.
-    let definition = registry.as_ref().and_then(|r| {
-        if *name.ns == ns!(html) {
-            r.lookup_definition(&name.local, is.as_ref())
-        } else {
-            None
-        }
-    });
+    let definition = CustomElementRegistry::lookup_custom_element_definition(
+        registry.as_deref(),
+        &name.ns,
+        &name.local,
+        is.as_ref(),
+    );
 
     // Step 4. If definition is non-null, and definition’s name is not equal to its local
     //         name (i.e., definition represents a customized built-in element):
