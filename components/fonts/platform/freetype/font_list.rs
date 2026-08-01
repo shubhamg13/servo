@@ -229,6 +229,7 @@ pub(crate) fn default_system_generic_font_family(
         GenericFontFamily::Monospace => c"monospace",
         GenericFontFamily::Cursive => c"cursive",
         GenericFontFamily::Fantasy => c"fantasy",
+        GenericFontFamily::Math => c"math",
         GenericFontFamily::SystemUi => c"sans-serif",
     };
 
@@ -270,6 +271,7 @@ pub(crate) fn default_system_generic_font_family(
         GenericFontFamily::Monospace => "Deja Vu Sans Mono",
         GenericFontFamily::Cursive => "Comic Sans MS",
         GenericFontFamily::Fantasy => "Impact",
+        GenericFontFamily::Math => "Latin Modern Math",
         GenericFontFamily::SystemUi => "Noto Sans",
     }
     .into()

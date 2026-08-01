@@ -114,6 +114,7 @@ pub struct Preferences {
     pub fonts_serif: String,
     pub fonts_sans_serif: String,
     pub fonts_monospace: String,
+    pub fonts_math: String,
     pub fonts_default_size: i64,
     pub fonts_default_monospace_size: i64,
     /// The amount of time that a half cycle of a text caret blink takes in milliseconds.
@@ -513,6 +514,7 @@ impl Preferences {
             fonts_default_monospace_size: 13,
             fonts_default_size: 16,
             fonts_monospace: String::new(),
+            fonts_math: String::new(),
             fonts_sans_serif: String::new(),
             fonts_serif: String::new(),
             gfx_precache_shaders: false,

@@ -40,6 +40,7 @@ struct ResolvedGenericFontFamilies {
     fantasy: OnceCell<LowercaseFontFamilyName>,
     cursive: OnceCell<LowercaseFontFamilyName>,
     system_ui: OnceCell<LowercaseFontFamilyName>,
+    math: OnceCell<LowercaseFontFamilyName>,
 }
 
 #[derive(Eq, Hash, MallocSizeOf, PartialEq)]
@@ -326,6 +327,7 @@ impl SystemFontService {
             GenericFontFamily::Monospace => &self.generic_fonts.monospace,
             GenericFontFamily::Cursive => &self.generic_fonts.cursive,
             GenericFontFamily::Fantasy => &self.generic_fonts.fantasy,
+            GenericFontFamily::Math => &self.generic_fonts.math,
             GenericFontFamily::SystemUi => &self.generic_fonts.system_ui,
         };
 
@@ -337,6 +339,7 @@ impl SystemFontService {
                     GenericFontFamily::Serif => pref!(fonts_serif),
                     GenericFontFamily::SansSerif => pref!(fonts_sans_serif),
                     GenericFontFamily::Monospace => pref!(fonts_monospace),
+                    GenericFontFamily::Math => pref!(fonts_math),
                     _ => String::new(),
                 };
 

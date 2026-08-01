@@ -1776,8 +1776,8 @@ impl FontMetricsProvider for LayoutFontMetricsProvider {
             cap_height: None,
             ic_width,
             ascent: first_font_metrics.ascent.into(),
-            script_percent_scale_down: None,
-            script_script_percent_scale_down: None,
+            script_percent_scale_down: Some(0.71),
+            script_script_percent_scale_down: Some(0.50),
         }
     }
 

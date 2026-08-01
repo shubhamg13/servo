@@ -421,3 +421,8 @@ marquee {
   vertical-align: text-bottom;
   white-space: nowrap;
 }
+
+/* https://w3c.github.io/mathml-core/#user-agent-stylesheet */
+math {
+  font-family: math;
+}

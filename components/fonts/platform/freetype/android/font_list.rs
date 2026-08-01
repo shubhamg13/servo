@@ -584,6 +584,7 @@ pub(crate) fn default_system_generic_font_family(
         GenericFontFamily::Monospace => "monospace",
         GenericFontFamily::Cursive => "cursive",
         GenericFontFamily::Fantasy => "serif",
+        GenericFontFamily::Math => "sans-serif",
         GenericFontFamily::SystemUi => "Droid Sans",
     }
     .into()

@@ -347,6 +347,7 @@ pub(crate) fn default_system_generic_font_family(
         GenericFontFamily::Monospace => "Courier New",
         GenericFontFamily::Cursive => "Comic Sans MS",
         GenericFontFamily::Fantasy => "Impact",
+        GenericFontFamily::Math => "Cambria Math",
         GenericFontFamily::SystemUi => "Segoe UI",
     }
     .into()

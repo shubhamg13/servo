@@ -72,6 +72,7 @@ impl HTMLFontElement {
             "fantasy" => return SingleFontFamily::Generic(GenericFontFamily::Fantasy),
             "monospace" => return SingleFontFamily::Generic(GenericFontFamily::Monospace),
             "system-ui" => return SingleFontFamily::Generic(GenericFontFamily::SystemUi),
+            "math" => return SingleFontFamily::Generic(GenericFontFamily::Math),
             _ => {}
         }
 

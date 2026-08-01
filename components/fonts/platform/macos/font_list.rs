@@ -237,6 +237,7 @@ pub(crate) fn default_system_generic_font_family(
         GenericFontFamily::Monospace => "Menlo",
         GenericFontFamily::Cursive => "Apple Chancery",
         GenericFontFamily::Fantasy => "Papyrus",
+        GenericFontFamily::Math => "STIX Two Math",
         GenericFontFamily::SystemUi => "Helvetica",
     }
     .into()
