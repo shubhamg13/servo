@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use app_units::Au;
 use euclid::Rect;
@@ -15,22 +15,38 @@ use webrender_api::units::{LayoutRect, LayoutSize};
 use crate::fragment_tree::Tag;
 use crate::query::transform_f32_rectangle;
 
+/// The type of LCP candidate, matching the spec's two loops in §4.2:
+/// `paintedImages` (Image) and `paintedTextNodes` (Text).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LCPCandidateKind {
+    Image,
+    Text,
+}
+
 pub(crate) struct PaintTimingHandler {
     /// The rect of viewport.
     viewport_rect: LayoutRect,
-    /// The document’s largest contentful paint size
+    /// The document's largest contentful paint size
     lcp_size: f32,
     /// Counter for generating unique LCP candidate UUIDs.
     lcp_next_uuid: u64,
     /// The LCP candidate, it may be a image or text.
     lcp_candidate: Option<LCPCandidate>,
-    /// The DOM node for the LCP candidate. Only used in ReflowResult
-    lcp_node: Option<OpaqueNode>,
+    /// The DOM node for the current LCP candidate. Only used in ReflowResult
+    current_lcp_node: Option<OpaqueNode>,
     /// Flag to indicate if there is an update to LCP candidate.
     /// This is used to avoid sending duplicate LCP candidates to `Paint`.
     lcp_candidate_updated: bool,
-    /// The set of nodes that have been reported as LCP candidates.
-    reported_lcp_nodes: HashSet<OpaqueNode>,
+    /// Nodes whose image LCP candidates have already been reported.
+    /// Corresponds to `paintedImages` in the spec.
+    reported_image_nodes: HashSet<OpaqueNode>,
+    /// Nodes whose text LCP candidates have already been reported.
+    /// Corresponds to `paintedTextNodes` in the spec. Checked inside
+    /// `compute_new_lcp_candidate` for `LCPCandidateKind::Text`.
+    reported_text_nodes: HashSet<OpaqueNode>,
+    /// Running union rects for text elements during the current paint
+    /// traversal. Updated per fragment in `compute_new_lcp_candidate`.
+    text_union_rects: HashMap<OpaqueNode, LayoutRect>,
 }
 
 impl PaintTimingHandler {
@@ -38,11 +54,13 @@ impl PaintTimingHandler {
         Self {
             lcp_size: 0.0,
             lcp_next_uuid: 0,
-            lcp_node: None,
+            current_lcp_node: None,
             lcp_candidate: None,
             lcp_candidate_updated: false,
             viewport_rect: LayoutRect::from_size(viewport_size),
-            reported_lcp_nodes: HashSet::new(),
+            reported_image_nodes: HashSet::new(),
+            reported_text_nodes: HashSet::new(),
+            text_union_rects: HashMap::new(),
         }
     }
 
@@ -162,6 +180,7 @@ impl PaintTimingHandler {
         url: Option<ServoUrl>,
         natural_width: Option<Au>,
         natural_height: Option<Au>,
+        kind: LCPCandidateKind,
     ) {
         // From <https://www.w3.org/TR/largest-contentful-paint/#sec-report-largest-contentful-paint>:
         // Each pending image record in paintedImages and text element in
@@ -169,24 +188,45 @@ impl PaintTimingHandler {
         // timing, for the first paint where the element is considered
         // paintable (i.e. has opacity and visibility) and contentful
         // (i.e. image resource or blocking fonts are sufficiently loaded).
-        if let Some(node) = tag.map(|tag| tag.node) &&
-            !self.reported_lcp_nodes.insert(node)
-        {
+        //
+        // Anonymous fragments (no tag) are not eligible for LCP.
+        let Some(tag) = tag else { return };
+        let reported_set = match kind {
+            LCPCandidateKind::Image => &mut self.reported_image_nodes,
+            LCPCandidateKind::Text => &mut self.reported_text_nodes,
+        };
+        if !reported_set.insert(tag.node) {
             return;
         }
 
-        // Step 4.1. Let imageElement be record’s element.
+        // Step 4.1. Let imageElement be record's element.
         // TODO Step 4.2. If imageElement is not exposed for paint timing, given
         // document, continue.
         // Note: We are only dealing with images for now.
 
         // Step 4.3. Let intersectionRect be the value returned by the intersection rect
         // algorithm using imageElement as the target and viewport as the root.
-        let intersection_rect = transform_f32_rectangle(clip_rect.to_rect(), transform)
-            .unwrap_or_default()
-            .intersection(&self.viewport_rect.to_rect())
-            .map(|rect| rect.to_box2d())
-            .unwrap_or_default();
+        let intersection_rect = match kind {
+            LCPCandidateKind::Image =>
+                transform_f32_rectangle(clip_rect.to_rect(), transform)
+                    .unwrap_or_default()
+                    .intersection(&self.viewport_rect.to_rect())
+                    .map(|rect| rect.to_box2d())
+                    .unwrap_or_default(),
+            LCPCandidateKind::Text => {
+                // For text: transform fragment rect to world space, update the
+                // running union for this element (handles line-wrapping across
+                // multiple fragments), then clip to viewport.
+                let world_rect = transform_f32_rectangle(clip_rect.to_rect(), transform)
+                    .unwrap_or_default()
+                    .to_box2d();
+                let running = self.text_union_rects.entry(tag.node).or_default();
+                *running = running.union(&world_rect);
+                running
+                    .intersection(&self.viewport_rect)
+                    .unwrap_or_default()
+            },
+        };
 
         // Step 4.4. Let result be the effective visual size of imageElement
         // given intersectionRect and record’s request.
@@ -214,7 +254,7 @@ impl PaintTimingHandler {
 
         let uuid = self.lcp_next_uuid;
         self.lcp_next_uuid += 1;
-        self.lcp_node = tag.map(|tag| tag.node);
+        self.current_lcp_node = Some(tag.node);
 
         // Step 4.8. Set newCandidate to be a new largest contentful paint candidate ...
         self.lcp_candidate = Some(LCPCandidate::new(
@@ -224,6 +264,27 @@ impl PaintTimingHandler {
         ));
 
         self.lcp_candidate_updated = true;
+    }
+
+    /// Called from `visit_text` for each text fragment during paint traversal.
+    /// Delegates to `compute_new_lcp_candidate` which handles transform,
+    /// running union accumulation, and viewport intersection for text.
+    pub(crate) fn collect_text_lcp_fragment(
+        &mut self,
+        tag: Option<Tag>,
+        local_rect: LayoutRect,
+        transform: FastLayoutTransform,
+    ) {
+        self.compute_new_lcp_candidate(
+            tag,
+            local_rect,
+            local_rect,
+            transform,
+            None,
+            None,
+            None,
+            LCPCandidateKind::Text,
+        );
     }
 
     pub(crate) fn did_lcp_candidate_update(&self) -> bool {
@@ -238,7 +299,7 @@ impl PaintTimingHandler {
         self.lcp_candidate.clone()
     }
 
-    pub(crate) fn lcp_node(&self) -> Option<OpaqueNode> {
-        self.lcp_node
+    pub(crate) fn current_lcp_node(&self) -> Option<OpaqueNode> {
+        self.current_lcp_node
     }
 }

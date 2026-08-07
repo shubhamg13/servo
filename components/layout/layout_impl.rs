@@ -1039,7 +1039,7 @@ impl LayoutThread {
                 (
                     handler.largest_contentful_paint_candidate(),
                     handler
-                        .lcp_node()
+                        .current_lcp_node()
                         .map(|node| UntrustedNodeAddress(node.id() as *const c_void)),
                 )
             })

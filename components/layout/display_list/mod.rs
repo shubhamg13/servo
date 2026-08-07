@@ -69,6 +69,7 @@ use crate::fragment_tree::{
 use crate::geom::{
     LengthPercentageOrAuto, PhysicalPoint, PhysicalRect, PhysicalSides, PhysicalSize,
 };
+use crate::query::transform_f32_rectangle;
 use crate::replaced::NaturalSizes;
 use crate::style_ext::{BorderStyleColor, ComputedValuesExt};
 
@@ -82,6 +83,7 @@ mod paint_traversal;
 mod stacking_context;
 
 pub(crate) use hit_test::HitTest;
+use paint_timing_handler::LCPCandidateKind;
 pub(crate) use paint_timing_handler::PaintTimingHandler;
 pub(crate) use stacking_context::*;
 
@@ -676,6 +678,7 @@ impl DisplayListBuilder<'_> {
             url,
             natural_width,
             natural_height,
+            LCPCandidateKind::Image,
         );
     }
 
@@ -1173,6 +1176,23 @@ impl Fragment {
         // An element target is contentful when one or more of the following apply:
         // > target has a text node child, representing non-empty text, and the node’s used opacity is greater than zero.
         builder.mark_is_contentful();
+
+        // Submit text fragment for LCP. compute_new_lcp_candidate handles
+        // transforms, running union, and viewport intersection internally.
+        if let Some(tag) = state.containing_element_tag {
+            let local_rect = fragment
+                .base
+                .rect()
+                .translate(containing_block.origin.to_vector())
+                .to_webrender();
+            let transform = builder
+                .paint_info
+                .scroll_tree
+                .cumulative_node_to_root_transform(state.spatial_id);
+            builder
+                .paint_timing_handler
+                .collect_text_lcp_fragment(Some(tag), local_rect, transform);
+        }
 
         for text_decoration in state.text_decorations.iter() {
             if text_decoration
