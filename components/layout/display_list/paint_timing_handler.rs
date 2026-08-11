@@ -40,13 +40,11 @@ pub(crate) struct PaintTimingHandler {
     /// Nodes whose image LCP candidates have already been reported.
     /// Corresponds to `paintedImages` in the spec.
     reported_image_nodes: HashSet<OpaqueNode>,
-    /// Nodes whose text LCP candidates have already been reported.
-    /// Corresponds to `paintedTextNodes` in the spec. Checked inside
-    /// `compute_new_lcp_candidate` for `LCPCandidateKind::Text`.
-    reported_text_nodes: HashSet<OpaqueNode>,
     /// Running union rects for text elements during the current paint
     /// traversal. Updated per fragment in `compute_new_lcp_candidate`.
-    text_union_rects: HashMap<OpaqueNode, LayoutRect>,
+    /// Presence in this map also serves as the `paintedTextNodes` check:
+    /// each element is reported (inserted) exactly once.
+    reported_text_nodes: HashMap<OpaqueNode, LayoutRect>,
 }
 
 impl PaintTimingHandler {
@@ -59,8 +57,7 @@ impl PaintTimingHandler {
             lcp_candidate_updated: false,
             viewport_rect: LayoutRect::from_size(viewport_size),
             reported_image_nodes: HashSet::new(),
-            reported_text_nodes: HashSet::new(),
-            text_union_rects: HashMap::new(),
+            reported_text_nodes: HashMap::new(),
         }
     }
 
@@ -191,12 +188,17 @@ impl PaintTimingHandler {
         //
         // Anonymous fragments (no tag) are not eligible for LCP.
         let Some(tag) = tag else { return };
-        let reported_set = match kind {
-            LCPCandidateKind::Image => &mut self.reported_image_nodes,
-            LCPCandidateKind::Text => &mut self.reported_text_nodes,
-        };
-        if !reported_set.insert(tag.node) {
-            return;
+        match kind {
+            LCPCandidateKind::Image => {
+                if !self.reported_image_nodes.insert(tag.node) {
+                    return;
+                }
+            },
+            LCPCandidateKind::Text => {
+                if self.reported_text_nodes.contains_key(&tag.node) {
+                    return;
+                }
+            },
         }
 
         // Step 4.1. Let imageElement be record's element.
@@ -207,22 +209,20 @@ impl PaintTimingHandler {
         // Step 4.3. Let intersectionRect be the value returned by the intersection rect
         // algorithm using imageElement as the target and viewport as the root.
         let intersection_rect = match kind {
-            LCPCandidateKind::Image =>
-                transform_f32_rectangle(clip_rect.to_rect(), transform)
-                    .unwrap_or_default()
-                    .intersection(&self.viewport_rect.to_rect())
-                    .map(|rect| rect.to_box2d())
-                    .unwrap_or_default(),
+            LCPCandidateKind::Image => transform_f32_rectangle(clip_rect.to_rect(), transform)
+                .unwrap_or_default()
+                .intersection(&self.viewport_rect.to_rect())
+                .map(|rect| rect.to_box2d())
+                .unwrap_or_default(),
             LCPCandidateKind::Text => {
-                // For text: transform fragment rect to world space, update the
-                // running union for this element (handles line-wrapping across
-                // multiple fragments), then clip to viewport.
+                // For text: transform fragment rect to world space, insert as
+                // the initial entry (doubles as `paintedTextNodes` tracking
+                // via the `contains_key` check above), then clip to viewport.
                 let world_rect = transform_f32_rectangle(clip_rect.to_rect(), transform)
                     .unwrap_or_default()
                     .to_box2d();
-                let running = self.text_union_rects.entry(tag.node).or_default();
-                *running = running.union(&world_rect);
-                running
+                self.reported_text_nodes.insert(tag.node, world_rect);
+                world_rect
                     .intersection(&self.viewport_rect)
                     .unwrap_or_default()
             },
@@ -264,27 +264,6 @@ impl PaintTimingHandler {
         ));
 
         self.lcp_candidate_updated = true;
-    }
-
-    /// Called from `visit_text` for each text fragment during paint traversal.
-    /// Delegates to `compute_new_lcp_candidate` which handles transform,
-    /// running union accumulation, and viewport intersection for text.
-    pub(crate) fn collect_text_lcp_fragment(
-        &mut self,
-        tag: Option<Tag>,
-        local_rect: LayoutRect,
-        transform: FastLayoutTransform,
-    ) {
-        self.compute_new_lcp_candidate(
-            tag,
-            local_rect,
-            local_rect,
-            transform,
-            None,
-            None,
-            None,
-            LCPCandidateKind::Text,
-        );
     }
 
     pub(crate) fn did_lcp_candidate_update(&self) -> bool {
