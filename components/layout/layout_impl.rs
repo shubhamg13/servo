@@ -1481,10 +1481,6 @@ impl LayoutThread {
             built_display_list,
         );
 
-        // After traversal, finalize text LCP candidates by processing
-        // accumulated union rects (see PaintTimingHandler::finalize_text_lcp_candidates).
-        paint_timing_handler.finalize_text_lcp_candidates();
-
         if paint_timing_handler.did_lcp_candidate_update() &&
             let Some(lcp_candidate) = paint_timing_handler.largest_contentful_paint_candidate()
         {

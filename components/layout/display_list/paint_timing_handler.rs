@@ -183,6 +183,7 @@ impl PaintTimingHandler {
         natural_width: Option<Au>,
         natural_height: Option<Au>,
         kind: LCPCandidateKind,
+        text_node_tag: Option<Tag>,
     ) {
         // From <https://www.w3.org/TR/largest-contentful-paint/#sec-report-largest-contentful-paint>:
         // Each pending image record in paintedImages and text element in
@@ -193,6 +194,9 @@ impl PaintTimingHandler {
         //
         // Anonymous fragments (no tag) are not eligible for LCP.
         let Some(tag) = tag else { return };
+
+        // Gate and accumulate — per-element dedup for images,
+        // per-text-node dedup + per-element union for text.
         match kind {
             LCPCandidateKind::Image => {
                 if !self.reported_image_nodes.insert(tag.node) {
@@ -200,9 +204,12 @@ impl PaintTimingHandler {
                 }
             },
             LCPCandidateKind::Text => {
-                // Text LCP uses running union rects — accumulate every
-                // fragment's world-space rect, then gate and compute the
-                // candidate during finalization via `finalize_text_lcp_candidates`.
+                // Gate: each text DOM node is reported exactly once.
+                let Some(text_node_tag) = text_node_tag else { return };
+                if !self.reported_text_nodes.insert(text_node_tag.node) {
+                    return;
+                }
+                // Accumulate fragment rect into per-element running union.
                 let world_rect = transform_f32_rectangle(clip_rect.to_rect(), transform)
                     .unwrap_or_default()
                     .to_box2d();
@@ -210,7 +217,6 @@ impl PaintTimingHandler {
                     .entry(tag.node)
                     .and_modify(|r| *r = r.union(&world_rect))
                     .or_insert(world_rect);
-                return;
             },
         }
 
@@ -221,19 +227,43 @@ impl PaintTimingHandler {
 
         // Step 4.3. Let intersectionRect be the value returned by the intersection rect
         // algorithm using imageElement as the target and viewport as the root.
-        let intersection_rect = transform_f32_rectangle(clip_rect.to_rect(), transform)
-            .unwrap_or_default()
-            .intersection(&self.viewport_rect.to_rect())
-            .map(|rect| rect.to_box2d())
-            .unwrap_or_default();
+        //
+        // For text, bounds/clip_rect are overridden with the running union rect
+        // (in world space) so that effective_visual_size's step 8.5 clips by
+        // the full text area, not just the current fragment.
+        let intersection_rect;
+        let effective_bounds;
+        let effective_clip_rect;
+        let effective_transform;
+        match kind {
+            LCPCandidateKind::Image => {
+                intersection_rect = transform_f32_rectangle(clip_rect.to_rect(), transform)
+                    .unwrap_or_default()
+                    .intersection(&self.viewport_rect.to_rect())
+                    .map(|rect| rect.to_box2d())
+                    .unwrap_or_default();
+                effective_bounds = bounds;
+                effective_clip_rect = clip_rect;
+                effective_transform = transform;
+            },
+            LCPCandidateKind::Text => {
+                let union_rect = self.text_union_rects[&tag.node];
+                intersection_rect = union_rect
+                    .intersection(&self.viewport_rect)
+                    .unwrap_or_default();
+                effective_bounds = union_rect;
+                effective_clip_rect = union_rect;
+                effective_transform = FastLayoutTransform::identity();
+            },
+        };
 
         // Step 4.4. Let result be the effective visual size of imageElement
-        // given intersectionRect and record’s request.
+        // given intersectionRect and record's request.
         let result = self.effective_visual_size(
-            bounds,
-            clip_rect,
+            effective_bounds,
+            effective_clip_rect,
             intersection_rect,
-            transform,
+            effective_transform,
             natural_width,
             natural_height,
         );
@@ -263,59 +293,6 @@ impl PaintTimingHandler {
         ));
 
         self.lcp_candidate_updated = true;
-    }
-
-    /// Processes accumulated text union rects after the paint traversal
-    /// is complete. For each element whose fragments have been unioned,
-    /// computes the intersection with the viewport and evaluates whether
-    /// it's a new LCP candidate.
-    ///
-    /// Gating via `reported_text_nodes` ensures each text element is
-    /// considered only once (per the spec: each `paintedTextNodes` entry
-    /// is reported exactly once).
-    pub(crate) fn finalize_text_lcp_candidates(&mut self) {
-        let text_union_rects = std::mem::take(&mut self.text_union_rects);
-        for (node, union_rect) in text_union_rects {
-            // Gate: each text element is reported only once.
-            if !self.reported_text_nodes.insert(node) {
-                continue;
-            }
-
-            // Intersect the full union of all fragments with the viewport.
-            let intersection = union_rect
-                .intersection(&self.viewport_rect)
-                .unwrap_or_default();
-
-            // Effective visual size for text: area of intersection (image-specific
-            // adjustments in `effective_visual_size` don't apply — natural_width /
-            // natural_height are None for text).
-            let size = intersection.area();
-
-            // Skip if the intersection fills the viewport (spec §4.2 step 4.5).
-            if size >= self.viewport_rect.area() {
-                continue;
-            }
-
-            // Skip if not larger than the current largest (spec §4.2 step 4.6).
-            if size <= self.lcp_size {
-                continue;
-            }
-
-            // Update largestSize (spec §4.2 step 4.7).
-            self.lcp_size = size;
-
-            let uuid = self.lcp_next_uuid;
-            self.lcp_next_uuid += 1;
-            self.current_lcp_node = Some(node);
-
-            self.lcp_candidate = Some(LCPCandidate::new(
-                LCPCandidateID(uuid),
-                self.lcp_size as usize,
-                None, // text has no associated URL
-            ));
-
-            self.lcp_candidate_updated = true;
-        }
     }
 
     pub(crate) fn did_lcp_candidate_update(&self) -> bool {

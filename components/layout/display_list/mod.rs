@@ -678,6 +678,7 @@ impl DisplayListBuilder<'_> {
             natural_width,
             natural_height,
             LCPCandidateKind::Image,
+            None,
         );
     }
 
@@ -1195,6 +1196,7 @@ impl Fragment {
                 None,
                 None,
                 LCPCandidateKind::Text,
+                fragment.base.tag,
             );
         }
 

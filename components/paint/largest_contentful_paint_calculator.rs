@@ -30,11 +30,11 @@ impl LargestContentfulPaintCalculator {
         webview_id: &WebViewId,
     ) {
         assert!(self.enabled_for_webview(webview_id));
+        // Layout already selects the winner — we just keep the latest.
         self.lcp_containers
             .entry(pipeline_id)
             .or_default()
-            .lcp_candidates
-            .push(candidate);
+            .pending_lcp = Some(candidate);
     }
 
     pub(crate) fn enabled_for_webview(&self, webview_id: &WebViewId) -> bool {
