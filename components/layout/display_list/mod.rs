@@ -82,7 +82,6 @@ mod paint_traversal;
 mod stacking_context;
 
 pub(crate) use hit_test::HitTest;
-use paint_timing_handler::LCPCandidateKind;
 pub(crate) use paint_timing_handler::PaintTimingHandler;
 pub(crate) use stacking_context::*;
 
@@ -236,6 +235,7 @@ impl DisplayListBuilder<'_> {
 
         PaintTraversal::traverse(&stacking_context_tree.root_stacking_context, &mut builder);
         builder.paint_dom_inspector_highlight();
+        builder.paint_timing_handler.compute_new_lcp_candidate();
 
         webrender_display_list_builder.end().1
     }
@@ -650,7 +650,7 @@ impl DisplayListBuilder<'_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn check_for_lcp_candidate(
+    fn mark_paint_timing(
         &mut self,
         state: &TraversalState,
         bounds: LayoutRect,
@@ -664,21 +664,22 @@ impl DisplayListBuilder<'_> {
             return;
         }
 
+        // Anonymous fragments (no tag) are not eligible for LCP.
+        let Some(image_tag) = tag else { return };
+
         let transform = self
             .paint_info
             .scroll_tree
             .cumulative_node_to_root_transform(state.spatial_id);
 
-        self.paint_timing_handler.compute_new_lcp_candidate(
-            tag,
+        self.paint_timing_handler.collect_image_record(
+            image_tag,
             bounds,
             clip_rect,
             transform,
             url,
             natural_width,
             natural_height,
-            LCPCandidateKind::Image,
-            None,
         );
     }
 
@@ -854,7 +855,7 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
             if !fragment.showing_broken_image_icon {
                 self.mark_is_contentful();
 
-                self.check_for_lcp_candidate(
+                self.mark_paint_timing(
                     state,
                     rect,
                     common.clip_rect,
@@ -1178,26 +1179,13 @@ impl Fragment {
         builder.mark_is_contentful();
 
         if let Some(tag) = state.containing_element_tag {
-            let local_rect = fragment
-                .base
-                .rect()
-                .translate(containing_block.origin.to_vector())
-                .to_webrender();
             let transform = builder
                 .paint_info
                 .scroll_tree
                 .cumulative_node_to_root_transform(state.spatial_id);
-            builder.paint_timing_handler.compute_new_lcp_candidate(
-                Some(tag),
-                local_rect,
-                local_rect,
-                transform,
-                None,
-                None,
-                None,
-                LCPCandidateKind::Text,
-                fragment.base.tag,
-            );
+            builder
+                .paint_timing_handler
+                .accumulate_text_rect(tag, rect.to_webrender(), transform);
         }
 
         for text_decoration in state.text_decorations.iter() {
@@ -1934,7 +1922,7 @@ impl<'a> BuilderForBoxFragment<'a> {
 
                         let natural_width = Some(Au::from_f32_px(size.width / dppx));
                         let natural_height = Some(Au::from_f32_px(size.height / dppx));
-                        builder.check_for_lcp_candidate(
+                        builder.mark_paint_timing(
                             state,
                             layer.bounds,
                             layer.common.clip_rect,

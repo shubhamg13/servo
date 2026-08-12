@@ -15,12 +15,33 @@ use webrender_api::units::{LayoutRect, LayoutSize};
 use crate::fragment_tree::Tag;
 use crate::query::transform_f32_rectangle;
 
-/// The type of LCP candidate, matching the spec's two loops in §4.2:
-/// `paintedImages` (Image) and `paintedTextNodes` (Text).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LCPCandidateKind {
-    Image,
-    Text,
+/// An image LCP candidate collected during paint traversal.
+/// Corresponds to a `pending image record` in the spec.
+struct ImageRecord {
+    /// The image element this record belongs to.
+    tag: Tag,
+    /// The image rect (adjusted for object-fit/object-position).
+    bounds: LayoutRect,
+    /// The element's content box.
+    clip_rect: LayoutRect,
+    /// Cumulative transform to root space, computed at collection time.
+    transform: FastLayoutTransform,
+    /// The image URL. `None` for background images.
+    url: Option<ServoUrl>,
+    /// Intrinsic width, used for upscaling normalization.
+    natural_width: Option<Au>,
+    /// Intrinsic height, used for upscaling normalization.
+    natural_height: Option<Au>,
+}
+
+/// A text LCP candidate accumulated during paint traversal.
+/// Corresponds to a `text element` in the spec's `paintedTextNodes`.
+struct TextRecord {
+    /// The containing element this text belongs to.
+    tag: Tag,
+    /// All text fragment rects (world space). Unioned at compute time,
+    /// matching the spec's "union of the border boxes of all Text nodes".
+    rects: Vec<LayoutRect>,
 }
 
 pub(crate) struct PaintTimingHandler {
@@ -41,14 +62,13 @@ pub(crate) struct PaintTimingHandler {
     /// Corresponds to `paintedImages` in the spec.
     reported_image_nodes: HashSet<OpaqueNode>,
     /// Nodes whose text LCP candidates have already been reported.
-    /// Corresponds to `paintedTextNodes` in the spec. Checked during
-    /// finalization (`finalize_text_lcp_candidates`), after all fragments
-    /// have been accumulated into `text_union_rects`.
+    /// Corresponds to `paintedTextNodes` in the spec.
     reported_text_nodes: HashSet<OpaqueNode>,
-    /// Running union rects for text elements during the current paint
-    /// traversal. All text fragments belonging to the same element are
-    /// unioned here, then processed during finalization.
-    text_union_rects: HashMap<OpaqueNode, LayoutRect>,
+    /// Image records collected during the current paint traversal.
+    painted_images: Vec<ImageRecord>,
+    /// Text records accumulated during the current paint traversal,
+    /// keyed by containing element node.
+    painted_text_nodes: HashMap<OpaqueNode, TextRecord>,
 }
 
 impl PaintTimingHandler {
@@ -62,7 +82,8 @@ impl PaintTimingHandler {
             viewport_rect: LayoutRect::from_size(viewport_size),
             reported_image_nodes: HashSet::new(),
             reported_text_nodes: HashSet::new(),
-            text_union_rects: HashMap::new(),
+            painted_images: Vec::new(),
+            painted_text_nodes: HashMap::new(),
         }
     }
 
@@ -171,127 +192,133 @@ impl PaintTimingHandler {
         Some(size)
     }
 
-    /// <https://www.w3.org/TR/largest-contentful-paint/#compute-a-new-largest-contentful-paint-candidate>
+    /// Collects an image LCP candidate during paint traversal.
+    /// Evaluation is deferred until `compute_new_lcp_candidate`.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn compute_new_lcp_candidate(
+    pub(crate) fn collect_image_record(
         &mut self,
-        tag: Option<Tag>,
+        tag: Tag,
         bounds: LayoutRect,
         clip_rect: LayoutRect,
         transform: FastLayoutTransform,
         url: Option<ServoUrl>,
         natural_width: Option<Au>,
         natural_height: Option<Au>,
-        kind: LCPCandidateKind,
-        text_node_tag: Option<Tag>,
     ) {
-        // From <https://www.w3.org/TR/largest-contentful-paint/#sec-report-largest-contentful-paint>:
-        // Each pending image record in paintedImages and text element in
-        // paintedTextNodes will only be reported exactly once, from mark paint
-        // timing, for the first paint where the element is considered
-        // paintable (i.e. has opacity and visibility) and contentful
-        // (i.e. image resource or blocking fonts are sufficiently loaded).
-        //
-        // Anonymous fragments (no tag) are not eligible for LCP.
-        let Some(tag) = tag else { return };
+        self.painted_images.push(ImageRecord {
+            tag,
+            bounds,
+            clip_rect,
+            transform,
+            url,
+            natural_width,
+            natural_height,
+        });
+    }
 
-        // Gate and accumulate — per-element dedup for images,
-        // per-text-node dedup + per-element union for text.
-        match kind {
-            LCPCandidateKind::Image => {
-                if !self.reported_image_nodes.insert(tag.node) {
-                    return;
-                }
-            },
-            LCPCandidateKind::Text => {
-                // Gate: each text DOM node is reported exactly once.
-                let Some(text_node_tag) = text_node_tag else { return };
-                if !self.reported_text_nodes.insert(text_node_tag.node) {
-                    return;
-                }
-                // Accumulate fragment rect into per-element running union.
-                let world_rect = transform_f32_rectangle(clip_rect.to_rect(), transform)
-                    .unwrap_or_default()
-                    .to_box2d();
-                self.text_union_rects
-                    .entry(tag.node)
-                    .and_modify(|r| *r = r.union(&world_rect))
-                    .or_insert(world_rect);
-            },
-        }
+    /// Accumulates a text fragment's rect into the per-element record.
+    /// The fragment rect is provided in containing-block space; the
+    /// cumulative transform maps it to world space here.
+    /// Called per fragment during paint traversal.
+    /// Evaluation is deferred until `compute_new_lcp_candidate`.
+    pub(crate) fn accumulate_text_rect(
+        &mut self,
+        tag: Tag,
+        rect: LayoutRect,
+        transform: FastLayoutTransform,
+    ) {
+        let border_box = transform_f32_rectangle(rect.to_rect(), transform)
+            .unwrap_or_default()
+            .to_box2d();
+        self.painted_text_nodes
+            .entry(tag.node)
+            .and_modify(|record| record.rects.push(border_box))
+            .or_insert(TextRecord {
+                tag,
+                rects: vec![border_box],
+            });
+    }
 
-        // Step 4.1. Let imageElement be record's element.
-        // TODO Step 4.2. If imageElement is not exposed for paint timing, given
-        // document, continue.
-        // Note: We are only dealing with images for now.
+    /// <https://www.w3.org/TR/largest-contentful-paint/#compute-a-new-largest-contentful-paint-candidate>
+    ///
+    /// Evaluates all collected image and text records and selects the
+    /// largest contentful paint candidate. Called once after paint
+    /// traversal, before the display list is sent.
+    ///
+    /// Implements spec §4.2: iterates `paintedImages` then
+    /// `paintedTextNodes`, gating each element as "reported exactly once".
+    pub(crate) fn compute_new_lcp_candidate(&mut self) {
+        let mut largest_size = self.lcp_size;
+        let mut best: Option<(Tag, Option<ServoUrl>, f32)> = None;
 
-        // Step 4.3. Let intersectionRect be the value returned by the intersection rect
-        // algorithm using imageElement as the target and viewport as the root.
-        //
-        // For text, bounds/clip_rect are overridden with the running union rect
-        // (in world space) so that effective_visual_size's step 8.5 clips by
-        // the full text area, not just the current fragment.
-        let intersection_rect;
-        let effective_bounds;
-        let effective_clip_rect;
-        let effective_transform;
-        match kind {
-            LCPCandidateKind::Image => {
-                intersection_rect = transform_f32_rectangle(clip_rect.to_rect(), transform)
+        // Spec §4.2: "For each record of paintedImages".
+        for record in std::mem::take(&mut self.painted_images) {
+            if !self.reported_image_nodes.insert(record.tag.node) {
+                continue;
+            }
+            // Step 4.3: intersectionRect.
+            let intersection_rect =
+                transform_f32_rectangle(record.clip_rect.to_rect(), record.transform)
                     .unwrap_or_default()
                     .intersection(&self.viewport_rect.to_rect())
                     .map(|rect| rect.to_box2d())
                     .unwrap_or_default();
-                effective_bounds = bounds;
-                effective_clip_rect = clip_rect;
-                effective_transform = transform;
-            },
-            LCPCandidateKind::Text => {
-                let union_rect = self.text_union_rects[&tag.node];
-                intersection_rect = union_rect
-                    .intersection(&self.viewport_rect)
-                    .unwrap_or_default();
-                effective_bounds = union_rect;
-                effective_clip_rect = union_rect;
-                effective_transform = FastLayoutTransform::identity();
-            },
-        };
-
-        // Step 4.4. Let result be the effective visual size of imageElement
-        // given intersectionRect and record's request.
-        let result = self.effective_visual_size(
-            effective_bounds,
-            effective_clip_rect,
-            intersection_rect,
-            effective_transform,
-            natural_width,
-            natural_height,
-        );
-
-        // Step 4.5. If result is null, continue.
-        let Some(result) = result else {
-            return;
-        };
-
-        // Step 4.6. If result’s size is less than or equal to largestSize, continue.
-        if result <= self.lcp_size {
-            return;
+            // Step 4.4: effective visual size.
+            let Some(size) = self.effective_visual_size(
+                record.bounds,
+                record.clip_rect,
+                intersection_rect,
+                record.transform,
+                record.natural_width,
+                record.natural_height,
+            ) else {
+                continue;
+            };
+            if size > largest_size {
+                largest_size = size;
+                best = Some((record.tag, record.url, size));
+            }
         }
 
-        // Step 4.7. Set largestSize to result’s size.
-        self.lcp_size = result;
+        // Spec §4.2: "For each textNode of paintedTextNodes".
+        for (node, record) in std::mem::take(&mut self.painted_text_nodes) {
+            if !self.reported_text_nodes.insert(node) {
+                continue;
+            }
+            // Spec: "union of the border boxes of all Text nodes".
+            let union_rect = record
+                .rects
+                .into_iter()
+                .reduce(|a, b| a.union(&b))
+                .unwrap_or_default();
+            // Step 4.3: intersectionRect (identity — rects are world-space).
+            let intersection_rect = union_rect
+                .intersection(&self.viewport_rect)
+                .unwrap_or_default();
+            // Step 4.4: effective visual size.
+            let Some(size) = self.effective_visual_size(
+                union_rect,
+                union_rect,
+                intersection_rect,
+                FastLayoutTransform::identity(),
+                None,
+                None,
+            ) else {
+                continue;
+            };
+            if size > largest_size {
+                largest_size = size;
+                best = Some((record.tag, None, size));
+            }
+        }
+
+        let Some((tag, url, size)) = best else { return };
+        self.lcp_size = largest_size;
 
         let uuid = self.lcp_next_uuid;
         self.lcp_next_uuid += 1;
         self.current_lcp_node = Some(tag.node);
-
-        // Step 4.8. Set newCandidate to be a new largest contentful paint candidate ...
-        self.lcp_candidate = Some(LCPCandidate::new(
-            LCPCandidateID(uuid),
-            self.lcp_size as usize,
-            url,
-        ));
-
+        self.lcp_candidate = Some(LCPCandidate::new(LCPCandidateID(uuid), size as usize, url));
         self.lcp_candidate_updated = true;
     }
 

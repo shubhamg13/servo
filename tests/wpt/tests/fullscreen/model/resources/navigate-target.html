@@ -1,0 +1,9 @@
+<!DOCTYPE html>
+<title>Navigation target for fullscreen exit test</title>
+<script>
+const exited = document.fullscreenElement === null;
+top.postMessage({
+  type: "fullscreen-exit-result",
+  exited: exited,
+}, "*");
+</script>

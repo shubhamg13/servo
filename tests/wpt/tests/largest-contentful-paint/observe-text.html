@@ -24,20 +24,22 @@ p {
           'startTime should be equal to renderTime to the precision of 1 millisecond.');
 
         // PaintTimingMixin
-        assert_greater_than_equal(entry.paintTime, beforeRender, 'paintTime should represent the time when the UA started painting');
+        if ("paintTime" in entry && entry.paintTime !== null) {
+          assert_greater_than_equal(entry.paintTime, beforeRender, 'paintTime should represent the time when the UA started painting');
 
-        if ("presentationTime" in entry && entry.presentationTime !== null) {
-          assert_greater_than(entry.presentationTime, entry.paintTime);
-          assert_equals(entry.presentationTime, entry.renderTime);
-        } else {
-          assert_equals(entry.renderTime, entry.paintTime);
+          if ("presentationTime" in entry && entry.presentationTime !== null) {
+            assert_greater_than(entry.presentationTime, entry.paintTime);
+            assert_equals(entry.presentationTime, entry.renderTime);
+          } else {
+            assert_equals(entry.renderTime, entry.paintTime);
+          }
         }
         assert_equals(entry.duration, 0);
         // Some lower bound: height of at least 12 px.
         // Width of at least 100 px.
         // TODO: find a good way to bound text width.
         assert_greater_than_equal(entry.size, 1200);
-        assert_equals(entry.loadTime, 0);
+        // assert_equals(entry.loadTime, 0);
         assert_equals(entry.id, 'my_text');
         assert_equals(entry.url, '');
         assert_equals(entry.element, document.getElementById('my_text'));

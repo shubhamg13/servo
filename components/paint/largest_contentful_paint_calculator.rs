@@ -65,11 +65,13 @@ impl LargestContentfulPaintCalculator {
     }
 }
 
-/// Holds the LCP candidates and the latest LCP for a specific pipeline.
+/// Holds the pending LCP candidate and the latest LCP for a pipeline.
 #[derive(Default)]
 struct LargestContentfulPaintsContainer {
-    /// List of candidates for Largest Contentful Paint in this pipeline.
-    lcp_candidates: Vec<LCPCandidate>,
+    /// The most recent LCP candidate received from layout. Layout already
+    /// selects the candidate with the largest effective visual size, so we
+    /// only need to compare against the persisted winner.
+    pending_lcp: Option<LCPCandidate>,
     /// The most recent Largest Contentful Paint, if any.
     latest_lcp: Option<LargestContentfulPaint>,
 }
@@ -79,25 +81,16 @@ impl LargestContentfulPaintsContainer {
         &mut self,
         paint_time: CrossProcessInstant,
     ) -> Option<LargestContentfulPaint> {
-        if self.lcp_candidates.is_empty() {
+        let Some(candidate) = self.pending_lcp.take() else {
             return self.latest_lcp.clone();
+        };
+        if self
+            .latest_lcp
+            .as_ref()
+            .map_or(true, |l| candidate.area > l.area)
+        {
+            self.latest_lcp = Some(LargestContentfulPaint::from(candidate, paint_time));
         }
-
-        let candidates = std::mem::take(&mut self.lcp_candidates);
-        if let Some(max_candidate) = candidates.into_iter().max_by_key(|c| c.area) {
-            match self.latest_lcp {
-                None => {
-                    self.latest_lcp = Some(LargestContentfulPaint::from(max_candidate, paint_time));
-                },
-                Some(ref latest_lcp) => {
-                    if max_candidate.area > latest_lcp.area {
-                        self.latest_lcp =
-                            Some(LargestContentfulPaint::from(max_candidate, paint_time));
-                    }
-                },
-            }
-        }
-
         self.latest_lcp.clone()
     }
 }
