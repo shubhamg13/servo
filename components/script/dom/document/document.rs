@@ -265,6 +265,9 @@ struct LCPCandidateAndElement {
     element: Dom<Element>,
     #[no_trace]
     candidate: LCPCandidate,
+    /// The time the candidate's image became completely available, if any.
+    #[no_trace]
+    load_time: Option<CrossProcessInstant>,
 }
 
 impl RefreshRedirectDue {
@@ -3531,11 +3534,15 @@ impl Document {
     }
 
     pub(crate) fn store_lcp_candidate(&self, candidate: LCPCandidate, element: &Element) {
+        let load_time = element
+            .downcast::<HTMLImageElement>()
+            .and_then(HTMLImageElement::load_time);
         self.lcp_candidates.borrow_mut().insert(
             candidate.id,
             LCPCandidateAndElement {
                 element: Dom::from_ref(element),
                 candidate,
+                load_time,
             },
         );
     }
@@ -3564,13 +3571,14 @@ impl Document {
             },
             ProgressiveWebMetricType::LargestContentfulPaint { id } => {
                 let candidate = self.lcp_candidates.borrow_mut().remove(&id);
-                let (element, area, url) = match candidate {
+                let (element, area, url, load_time) = match candidate {
                     Some(stored_candidate) => (
                         Some(stored_candidate.element),
                         stored_candidate.candidate.area,
                         stored_candidate.candidate.url,
+                        stored_candidate.load_time,
                     ),
-                    None => (None, 0, None),
+                    None => (None, 0, None, None),
                 };
                 let binding = LargestContentfulPaint::new(
                     cx,
@@ -3579,6 +3587,7 @@ impl Document {
                     area,
                     url,
                     element.as_deref(),
+                    load_time,
                 );
                 metrics.set_largest_contentful_paint(id, metric_value);
                 let entry = binding.upcast::<PerformanceEntry>();

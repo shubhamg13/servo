@@ -39,6 +39,7 @@ impl LargestContentfulPaint {
         size: usize,
         url: Option<ServoUrl>,
         element: Option<&Element>,
+        load_time: Option<CrossProcessInstant>,
     ) -> LargestContentfulPaint {
         LargestContentfulPaint {
             entry: PerformanceEntry::new_inherited(
@@ -47,7 +48,7 @@ impl LargestContentfulPaint {
                 Some(render_time),
                 Duration::ZERO,
             ),
-            load_time: None,
+            load_time,
             render_time,
             size,
             url: url.map(|u| DOMString::from(u.as_str())).unwrap_or_default(),
@@ -64,6 +65,7 @@ impl LargestContentfulPaint {
         size: usize,
         url: Option<ServoUrl>,
         element: Option<&Element>,
+        load_time: Option<CrossProcessInstant>,
     ) -> DomRoot<LargestContentfulPaint> {
         reflect_dom_object(
             cx,
@@ -72,6 +74,7 @@ impl LargestContentfulPaint {
                 size,
                 url,
                 element,
+                load_time,
             )),
             global,
         )
