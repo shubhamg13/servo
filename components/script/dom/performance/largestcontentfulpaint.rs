@@ -59,7 +59,7 @@ impl LargestContentfulPaint {
             ),
             load_time,
             render_time,
-            size: candidate.area,
+            size: candidate.size,
             url: candidate
                 .url
                 .as_ref()
