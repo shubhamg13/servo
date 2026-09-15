@@ -100,6 +100,13 @@ impl PaintTimingHandler {
         }
     }
 
+    /// Returns a next id for a new largest-contentful-paint candidate.
+    fn next_lcp_candidate_id(&mut self) -> LCPCandidateID {
+        let id = LCPCandidateID(self.lcp_next_uuid);
+        self.lcp_next_uuid += 1;
+        id
+    }
+
     /// Marks the current display list as containing a paintable item.
     pub(crate) fn mark_document_is_paintable(&mut self) {
         self.is_document_paintable = true;
@@ -173,13 +180,17 @@ impl PaintTimingHandler {
         &self,
         intersection_rect: LayoutRect,
         candidate_type: LCPCandidateType<'_>,
-    ) -> Option<f32> {
+    ) -> Option<(usize, usize, usize)> {
         // Step 1. Let width be intersectionRect's width, rounded up to the
         // nearest integer.
+        let mut width = intersection_rect.width().ceil();
+
         // Step 2. Let height be intersectionRect's height, rounded up to the
         // nearest integer.
+        let mut height = intersection_rect.height().ceil();
+
         // Step 3. Let size be width * height.
-        let mut size = intersection_rect.area();
+        let mut size = width * height;
 
         // Step 4. Let root be document's browsing context's top-level browsing
         // context's active document.
@@ -226,10 +237,14 @@ impl PaintTimingHandler {
 
             // Step 8.6: Set width to intersectingClientContentRect's width,
             // rounded up to the nearest integer.
+            width = intersecting_client_content_rect.width().ceil();
+
             // Step 8.7: Set height to intersectingClientContentRect's height,
             // rounded up to the nearest integer.
+            height = intersecting_client_content_rect.height().ceil();
+
             // Step 8.8: Set size to width * height.
-            size = intersecting_client_content_rect.area();
+            size = width * height;
 
             // Step 8.9: Let naturalArea be imageRequest's natural width * imageRequest's natural height.
             if let (Some(natural_width), Some(natural_height)) =
@@ -258,7 +273,7 @@ impl PaintTimingHandler {
 
         // Step 9: Return an effective visual size result with size set to size,
         // width set to width, and height set to height.
-        Some(size)
+        Some((size as usize, width as usize, height as usize))
     }
 
     /// <https://www.w3.org/TR/largest-contentful-paint/#compute-a-new-largest-contentful-paint-candidate>
@@ -277,11 +292,12 @@ impl PaintTimingHandler {
     ) -> Option<LCPCandidate> {
         // Step 1. Let currentSize be currentCandidate’s size if
         // currentCandidate is not null or 0 otherwise.
-        // Step 2. Let largestSize be currentSize.
-        let mut largest_size = self
+        let current_size = self
             .lcp_candidate
             .as_ref()
-            .map_or(0.0, |candidate| candidate.area as f32);
+            .map_or(0, |candidate| candidate.size);
+        // Step 2. Let largestSize be currentSize.
+        let mut largest_size = current_size;
 
         // Step 3. Let newCandidate be null.
         let mut new_candidate = None;
@@ -311,24 +327,24 @@ impl PaintTimingHandler {
                 self.effective_visual_size(intersection_rect, LCPCandidateType::Image(&record));
 
             // Step 4.5. If result is null, continue.
-            let Some(result) = result else {
+            let Some((size, width, height)) = result else {
                 continue;
             };
             // Step 4.6. If result's size is less than or equal to
             // largestSize, continue.
-            if result <= largest_size {
+            if size <= largest_size {
                 continue;
             }
 
             // Step 4.7. Set largestSize to result’s size.
-            largest_size = result;
+            largest_size = size;
 
             // Step 4.8. Set newCandidate to be a new largest contentful paint candidate ...
-            let uuid = self.lcp_next_uuid;
-            self.lcp_next_uuid += 1;
             new_candidate = Some(LCPCandidate::new(
-                LCPCandidateID(uuid),
-                result as usize,
+                self.next_lcp_candidate_id(),
+                size,
+                width,
+                height,
                 record.url,
                 record.tag.map(|tag| tag.node),
             ));
@@ -368,33 +384,44 @@ impl PaintTimingHandler {
             let result = self.effective_visual_size(intersection_rect, LCPCandidateType::Text);
 
             // Step 5.5. If result is null, continue.
-            let Some(result) = result else {
+            let Some((size, width, height)) = result else {
                 continue;
             };
             // Step 5.6. If result's size is less than or equal to
             // largestSize, continue.
-            if result <= largest_size {
+            if size <= largest_size {
                 continue;
             }
 
             // Step 5.7. Set largestSize to result’s size.
-            largest_size = result;
+            largest_size = size;
 
             // Step 5.8. Set newCandidate to be a new largest contentful paint candidate ...
-            let uuid = self.lcp_next_uuid;
-            self.lcp_next_uuid += 1;
             new_candidate = Some(LCPCandidate::new(
-                LCPCandidateID(uuid),
-                result as usize,
+                self.next_lcp_candidate_id(),
+                size,
+                width,
+                height,
                 None,
                 Some(record.tag.node),
             ));
         }
 
-        // TODO Step 6. If newCandidate is not null and currentSize is greater than 0:
-        // TODO Step 6.1. If newCandidate’s width minus currentCandidate’s
-        // width is less than or equal to 3, and newCandidate’s height minus
-        // currentCandidate’s height is less than or equal to 3, return null.
+        // Step 6. If newCandidate is not null and currentSize is greater than 0:
+        if let Some(new_candidate) = &new_candidate &&
+            current_size > 0
+        {
+            // Step 6.1. If newCandidate’s width minus currentCandidate’s width
+            // is less than or equal to 3, and newCandidate’s height minus
+            // currentCandidate’s height is less than or equal to 3, return null.
+            if let Some(current_candidate) = &self.lcp_candidate {
+                if new_candidate.width as isize - current_candidate.width as isize <= 3 &&
+                    new_candidate.height as isize - current_candidate.height as isize <= 3
+                {
+                    return None;
+                }
+            }
+        }
 
         // Step 7. Return newCandidate.
         new_candidate

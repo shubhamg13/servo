@@ -262,6 +262,7 @@ pub(crate) struct RefreshRedirectDue {
 #[derive(JSTraceable, MallocSizeOf)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 struct LCPCandidateAndElement {
+    /// <https://www.w3.org/TR/largest-contentful-paint/#largest-contentful-paint-candidate-element>
     element: Dom<Element>,
     #[no_trace]
     candidate: LCPCandidate,
@@ -3567,7 +3568,7 @@ impl Document {
                 let (element, area, url) = match candidate {
                     Some(stored_candidate) => (
                         Some(stored_candidate.element),
-                        stored_candidate.candidate.area,
+                        stored_candidate.candidate.size,
                         stored_candidate.candidate.url,
                     ),
                     None => (None, 0, None),

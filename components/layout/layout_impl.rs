@@ -1538,7 +1538,7 @@ impl LayoutThread {
 
         if let Some(lcp_candidate) = paint_timing_handler.largest_contentful_paint_candidate() {
             stacking_context_tree.paint_info.lcp_candidate =
-                Some((lcp_candidate.id, lcp_candidate.area));
+                Some((lcp_candidate.id, lcp_candidate.size));
         } else {
             stacking_context_tree.paint_info.lcp_candidate = None;
         }

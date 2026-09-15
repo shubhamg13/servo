@@ -17,10 +17,15 @@ use style::dom::OpaqueNode;
 pub struct LCPCandidate {
     /// A unique identifier for this candidate.
     pub id: LCPCandidateID,
-    /// The size of the visual area.
-    pub area: usize,
-    /// The candidate's request URL.
+    /// <https://www.w3.org/TR/largest-contentful-paint/#largest-contentful-paint-candidate-size>
+    pub size: usize,
+    /// <https://www.w3.org/TR/largest-contentful-paint/#largest-contentful-paint-candidate-width>
+    pub width: usize,
+    /// <https://www.w3.org/TR/largest-contentful-paint/#largest-contentful-paint-candidate-height>
+    pub height: usize,
+    /// <https://www.w3.org/TR/largest-contentful-paint/#largestcontentfulpaint-url>
     pub url: Option<ServoUrl>,
+    /// For <https://www.w3.org/TR/largest-contentful-paint/#largest-contentful-paint-candidate-element>
     /// The DOM node of the candidate's element, if any.
     pub node: Option<OpaqueNode>,
 }
@@ -28,13 +33,17 @@ pub struct LCPCandidate {
 impl LCPCandidate {
     pub fn new(
         id: LCPCandidateID,
-        area: usize,
+        size: usize,
+        width: usize,
+        height: usize,
         url: Option<ServoUrl>,
         node: Option<OpaqueNode>,
     ) -> Self {
         Self {
             id,
-            area,
+            size,
+            width,
+            height,
             url,
             node,
         }
