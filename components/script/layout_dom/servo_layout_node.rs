@@ -276,6 +276,10 @@ impl<'dom> LayoutNode<'dom> for ServoLayoutNode<'dom> {
         self.node.image_data()
     }
 
+    fn image_generation(&self) -> u32 {
+        self.node.image_generation()
+    }
+
     fn canvas_data(&self) -> Option<HTMLCanvasData> {
         self.node.canvas_data()
     }

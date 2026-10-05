@@ -313,6 +313,12 @@ impl<'dom> LayoutDom<'dom, Node> {
         self.downcast::<HTMLImageElement>().map(|e| e.image_data())
     }
 
+    pub(crate) fn image_generation(self) -> u32 {
+        self.downcast::<HTMLImageElement>()
+            .map(|image_element| image_element.image_generation())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn image_density(self) -> Option<f64> {
         self.downcast::<HTMLImageElement>()
             .expect("not an image!")

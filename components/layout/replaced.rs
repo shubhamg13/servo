@@ -142,6 +142,10 @@ pub(crate) struct ImageInfo {
     pub image: Option<Image>,
     pub showing_broken_image_icon: bool,
     pub url: Option<ServoUrl>,
+    /// Identifies the image request this image was painted from, incremented for every
+    /// new request of an image element and `0` when the image does not come from an
+    /// element's image request.
+    pub generation: u32,
 }
 
 #[derive(Debug, MallocSizeOf)]
@@ -390,6 +394,7 @@ impl ReplacedContents {
                 image,
                 showing_broken_image_icon: false,
                 url: Some(image_url.clone().into()),
+                generation: 0,
             }),
             is_content_replacement: false,
             selected: Arc::new(AtomicBool::new(node.replaced_is_selected())),
@@ -419,6 +424,7 @@ impl ReplacedContents {
                 image: None,
                 showing_broken_image_icon: false,
                 url: None,
+                generation: 0,
             }),
             is_content_replacement: false,
             selected: Default::default(),
@@ -459,7 +465,7 @@ impl ReplacedContents {
         if let ReplacedContentKind::Image(ImageInfo {
             image: Some(Image::Raster(image)),
             showing_broken_image_icon: true,
-            url: _,
+            ..
         }) = &self.kind
         {
             let size = Size2D::new(
@@ -549,6 +555,7 @@ impl ReplacedContents {
                         image_key: Some(image_key),
                         showing_broken_image_icon: image_info.showing_broken_image_icon,
                         url: image_info.url.clone(),
+                        generation: image_info.generation,
                         natural_width: self.natural_size.width,
                         natural_height: self.natural_size.height,
                         selected: self.selected.clone(),
@@ -565,6 +572,7 @@ impl ReplacedContents {
                     image_key: video_info.image_key,
                     showing_broken_image_icon: false,
                     url: video_info.poster_url.clone(),
+                    generation: 0,
                     natural_width: self.natural_size.width,
                     natural_height: self.natural_size.height,
                     selected: self.selected.clone(),
@@ -611,6 +619,7 @@ impl ReplacedContents {
                     image_key: Some(image_key),
                     showing_broken_image_icon: false,
                     url: None,
+                    generation: 0,
                     natural_width: self.natural_size.width,
                     natural_height: self.natural_size.height,
                     selected: self.selected.clone(),
@@ -668,6 +677,7 @@ impl ReplacedContents {
                             image_key: Some(image_key),
                             showing_broken_image_icon: false,
                             url: None,
+                            generation: 0,
                             natural_width: self.natural_size.width,
                             natural_height: self.natural_size.height,
                             selected: self.selected.clone(),

@@ -1461,6 +1461,11 @@ impl<'dom> LayoutDom<'dom, HTMLImageElement> {
         (current_request.image.clone(), current_request.metadata)
     }
 
+    /// A counter that is incremented every time this element starts a new image request.
+    pub(crate) fn image_generation(self) -> u32 {
+        self.unsafe_get().generation.get()
+    }
+
     pub(crate) fn image_density(self) -> Option<f64> {
         self.current_request().current_pixel_density
     }

@@ -669,6 +669,7 @@ impl DisplayListBuilder<'_> {
         url: Option<ServoUrl>,
         natural_width: Option<Au>,
         natural_height: Option<Au>,
+        generation: u32,
     ) {
         if !self.largest_contentful_paint_enabled {
             return;
@@ -687,6 +688,7 @@ impl DisplayListBuilder<'_> {
             url,
             natural_width,
             natural_height,
+            generation,
         );
     }
 
@@ -872,6 +874,7 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
                     fragment.url.clone(),
                     fragment.natural_width,
                     fragment.natural_height,
+                    fragment.generation,
                 );
             }
         }
@@ -1930,6 +1933,7 @@ impl<'a> BuilderForBoxFragment<'a> {
                             None,
                             natural_width,
                             natural_height,
+                            0,
                         );
                     }
                 },

@@ -498,6 +498,7 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
                 image: resource,
                 showing_broken_image_icon: self.showing_broken_image_icon(),
                 url: self.image_url(),
+                generation: self.image_generation(),
             },
             PhysicalSize::new(width, height),
         ))

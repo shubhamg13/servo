@@ -127,6 +127,10 @@ pub(crate) struct ImageFragment {
     pub natural_width: Option<Au>,
     /// The intrinsic (natural) height of the image, if known.
     pub natural_height: Option<Au>,
+    /// Identifies the image request this image was painted from, incremented for every
+    /// new request of an image element and `0` when the image does not come from an
+    /// element's image request.
+    pub generation: u32,
     /// Whether or not this image is selected.
     #[conditional_malloc_size_of]
     pub selected: Arc<AtomicBool>,

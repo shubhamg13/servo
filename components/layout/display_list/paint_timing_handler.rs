@@ -37,6 +37,9 @@ struct PendingImageRecord {
     natural_width: Option<Au>,
     /// Intrinsic height, used for upscaling normalization.
     natural_height: Option<Au>,
+    /// Identifies the image request this record belongs to, see
+    /// [`LayoutNode::image_generation`](layout_api::LayoutNode::image_generation).
+    generation: u32,
 }
 
 /// <https://w3c.github.io/paint-timing/#sec-recording-paint-timing>
@@ -73,8 +76,9 @@ pub(crate) struct PaintTimingHandler {
     lcp_next_uuid: u64,
     /// The LCP candidate, it may be a image or text.
     lcp_candidate: Option<LCPCandidate>,
-    /// The set of image nodes that have been reported as LCP candidates.
-    reported_image_nodes: HashSet<OpaqueNode>,
+    /// The set of image elements and image requests that have been reported as LCP
+    /// candidates, so that each image request is only reported once.
+    reported_image_nodes: HashSet<(OpaqueNode, u32)>,
     /// <https://www.w3.org/TR/paint-timing/#images-pending-rendering>
     images_pending_rendering: Vec<PendingImageRecord>,
     /// <https://www.w3.org/TR/paint-timing/#set-of-elements-with-rendered-text>
@@ -92,8 +96,8 @@ impl PaintTimingHandler {
             previously_reported_paints: PaintTimingReport::default(),
             lcp_next_uuid: 0,
             lcp_candidate: None,
-            viewport_rect: LayoutRect::from_size(viewport_size),
             reported_image_nodes: HashSet::new(),
+            viewport_rect: LayoutRect::from_size(viewport_size),
             images_pending_rendering: Vec::new(),
             elements_with_rendered_text: HashSet::new(),
             elements_with_pending_rendered_text: HashMap::new(),
@@ -120,6 +124,7 @@ impl PaintTimingHandler {
         url: Option<ServoUrl>,
         natural_width: Option<Au>,
         natural_height: Option<Au>,
+        generation: u32,
     ) {
         self.images_pending_rendering.push(PendingImageRecord {
             tag,
@@ -129,6 +134,7 @@ impl PaintTimingHandler {
             url,
             natural_width,
             natural_height,
+            generation,
         });
     }
 
@@ -512,12 +518,17 @@ impl PaintTimingHandler {
         // Note: Only available images are accumulated, hence it is fulfilled.
         // Step 5.1.1. Append record to paintedImages.
         // Step 5.1.2. Remove record from doc's images pending rendering list.
+        // Note: Records are accumulated again on every display list build, so an image
+        // element can only contribute once per image request: repainting an element
+        // (for instance after a resize) must not report it again, while a new request
+        // for the same element (a changed `src`) is a new record.
         let painted_images: Vec<_> = std::mem::take(&mut self.images_pending_rendering)
             .into_iter()
             .filter(|record| {
-                record
-                    .tag
-                    .is_none_or(|tag| self.reported_image_nodes.insert(tag.node))
+                record.tag.is_none_or(|tag| {
+                    self.reported_image_nodes
+                        .insert((tag.node, record.generation))
+                })
             })
             .collect();
 

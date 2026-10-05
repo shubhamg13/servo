@@ -188,6 +188,13 @@ pub trait LayoutNode<'dom>: Copy + Debug + NodeInfo + Send + Sync {
     /// If this is an image element, returns its image data. Otherwise, returns `None`.
     fn image_data(&self) -> Option<(Option<Image>, Option<ImageMetadata>)>;
 
+    /// If this is an image element, returns a counter that is incremented every time it
+    /// starts a new image request. Otherwise, returns `0`.
+    ///
+    /// This identifies the image request that is being painted, which lets paint timing
+    /// tell a new request apart from another paint of the same one.
+    fn image_generation(&self) -> u32;
+
     /// Whether or not this node is selected when it is interpreted as a replaced element.
     fn replaced_is_selected(&self) -> bool;
 
