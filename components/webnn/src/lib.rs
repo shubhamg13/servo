@@ -3,7 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use servo_base::generic_channel::{
@@ -13,22 +12,20 @@ use servo_base::id::MLContextId;
 
 mod mock_backend;
 mod operator;
-#[cfg(any(feature = "rustnn", feature = "cann"))]
+#[cfg(feature = "rustnn")]
 mod rustnn_backend;
 
 pub use mock_backend::MockBackend;
-pub use operator::{Conv2dOptions, Operator, Pool2dOptions, ReduceOptions, Resample2dOptions};
+pub use operator::{
+    Conv2dOptions, ConvTranspose2dOptions, GemmOptions, Operator, Pool2dOptions, ReduceOptions,
+    Resample2dOptions,
+};
 
 pub type GraphId = usize;
 pub type BuilderId = usize;
 pub type OperandId = usize;
 /// Identifier of an `MLContext` on the shared WebNN backend thread.
 pub type ContextId = MLContextId;
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct RunResult {
-    pub outputs: Vec<Vec<u8>>,
-}
 
 // ── Backend options ──
 
@@ -40,12 +37,22 @@ pub enum BackendPowerPreference {
     LowPower,
 }
 
+/// <https://www.w3.org/TR/webnn/#enumdef-mldevicetype>
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BackendDeviceType {
+    Cpu,
+    Gpu,
+    Npu,
+}
+
 /// Backend-agnostic subset of `MLContextOptions`, used to select a backend.
 /// <https://www.w3.org/TR/webnn/#dictdef-mlcontextoptions>
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BackendOptions {
     pub power_preference: BackendPowerPreference,
     pub accelerated: bool,
+    /// Requested WebNN device type; used to select the concrete backend.
+    pub device_type: BackendDeviceType,
 }
 
 // ── Backend trait ──
@@ -82,12 +89,24 @@ pub trait Backend: Send + 'static {
         builder_id: BuilderId,
         outputs: &[(String, OperandId)],
     ) -> Result<GraphId, String>;
+    /// Runs a compiled graph with device-resident tensors referenced by Servo
+    /// tensor id. Inputs and outputs are `(name, tensor_id)` pairs; the backend
+    /// resolves ids to its own device tensors and never round-trips host bytes,
+    /// so a tensor produced by one graph can be consumed by another on device.
     fn run(
         &self,
         graph_id: GraphId,
-        inputs: &[(String, &[u8])],
-        output_labels: &[String],
-    ) -> Result<RunResult, String>;
+        inputs: &[(String, u32)],
+        outputs: &[(String, u32)],
+    ) -> Result<(), String>;
+    /// Allocates a device tensor for `tensor_id` with the given descriptor.
+    fn create_tensor(&self, tensor_id: u32, data_type: u32, shape: &[u32]) -> Result<(), String>;
+    /// Copies host bytes into the device tensor `tensor_id`.
+    fn write_tensor(&self, tensor_id: u32, bytes: &[u8]) -> Result<(), String>;
+    /// Materializes the device tensor `tensor_id` back to host bytes.
+    fn read_tensor(&self, tensor_id: u32) -> Result<Vec<u8>, String>;
+    /// Releases the device tensor `tensor_id`.
+    fn destroy_tensor(&self, tensor_id: u32);
     fn destroy_graph(&self, graph_id: GraphId);
 }
 
@@ -95,36 +114,24 @@ pub trait Backend: Send + 'static {
 
 /// Select a backend for a new context.
 ///
-/// This is the seam each backend plugs into. With the `cann` feature enabled
-/// this returns a `RustnnBackend` targeting the CANN (HiAI) NPU; with the
-/// `rustnn` feature it targets ONNX Runtime. In both cases it falls back to the
-/// mock backend if the context cannot be created (e.g. no runtime available);
-/// otherwise it always returns the mock backend.
-#[cfg(feature = "cann")]
-pub fn create_backend(options: &BackendOptions) -> Box<dyn Backend> {
-    match rustnn_backend::RustnnBackend::new_cann(options) {
-        Ok(backend) => Box::new(backend),
-        Err(err) => {
-            log::error!("cann backend creation failed ({err}); falling back to mock backend");
-            Box::new(MockBackend::new())
-        },
-    }
-}
-
-/// Select a backend for a new context (ONNX Runtime via rustnn).
-#[cfg(all(feature = "rustnn", not(feature = "cann")))]
+/// This is the seam each backend plugs into. With the `rustnn` feature the
+/// choice is rustnn's — it resolves the requested options against the backends
+/// compiled in for this target — and it falls back to the mock backend if no
+/// context can be created (e.g. no runtime available). Without the feature it
+/// always returns the mock backend.
+#[cfg(feature = "rustnn")]
 pub fn create_backend(options: &BackendOptions) -> Box<dyn Backend> {
     match rustnn_backend::RustnnBackend::new(options) {
         Ok(backend) => Box::new(backend),
         Err(err) => {
-            log::error!("rustnn backend creation failed ({err}); falling back to mock backend");
+            log::error!("webnn backend creation failed ({err}); falling back to mock backend");
             Box::new(MockBackend::new())
         },
     }
 }
 
 /// Select a backend for a new context (mock-only build).
-#[cfg(not(any(feature = "rustnn", feature = "cann")))]
+#[cfg(not(feature = "rustnn"))]
 pub fn create_backend(_options: &BackendOptions) -> Box<dyn Backend> {
     Box::new(MockBackend::new())
 }
@@ -138,7 +145,7 @@ pub struct BuildResponse {
 
 #[derive(Serialize, Deserialize)]
 pub struct RunResponse {
-    pub result: Result<RunResult, String>,
+    pub result: Result<(), String>,
 }
 
 /// Response to a `ReadTensor` request, carrying the tensor's raw bytes.
@@ -195,11 +202,14 @@ enum WebNNRequest {
     CreateTensor {
         context_id: ContextId,
         tensor_id: u32,
-        byte_length: usize,
+        data_type: u32,
+        shape: Vec<u32>,
     },
     CreateConstantTensor {
         context_id: ContextId,
         tensor_id: u32,
+        data_type: u32,
+        shape: Vec<u32>,
         bytes: Vec<u8>,
     },
     WriteTensor {
@@ -211,6 +221,10 @@ enum WebNNRequest {
         context_id: ContextId,
         tensor_id: u32,
         callback: GenericCallback<ReadTensorResponse>,
+    },
+    DestroyTensor {
+        context_id: ContextId,
+        tensor_id: u32,
     },
     Run {
         context_id: ContextId,
@@ -257,10 +271,6 @@ impl WebNN {
 /// owned by each context.
 fn run_webnn_thread(receiver: GenericReceiver<WebNNRequest>) {
     let mut backends: HashMap<ContextId, Box<dyn Backend>> = HashMap::new();
-    // Authoritative tensor byte storage, keyed by (context id, tensor id).
-    // Dispatch reads its inputs from here at execution time and writes its
-    // outputs back here, so chained dispatches observe each other's results.
-    let mut tensor_store: HashMap<(ContextId, u32), Arc<Vec<u8>>> = HashMap::new();
     while let Ok(request) = receiver.recv() {
         match request {
             WebNNRequest::NewContext {
@@ -268,9 +278,19 @@ fn run_webnn_thread(receiver: GenericReceiver<WebNNRequest>) {
                 options,
             } => {
                 backends.insert(context_id, create_backend(&options));
+                log::error!(
+                    "[webnn-leak] new_ctx {:?} backends={}",
+                    context_id,
+                    backends.len()
+                );
             },
             WebNNRequest::DestroyContext { context_id } => {
                 backends.remove(&context_id);
+                log::error!(
+                    "[webnn-leak] destroy_ctx {:?} backends={}",
+                    context_id,
+                    backends.len()
+                );
             },
             WebNNRequest::CreateBuilder { context_id, reply } => {
                 let id = backends
@@ -330,34 +350,67 @@ fn run_webnn_thread(receiver: GenericReceiver<WebNNRequest>) {
             WebNNRequest::CreateTensor {
                 context_id,
                 tensor_id,
-                byte_length,
+                data_type,
+                shape,
             } => {
-                tensor_store.insert((context_id, tensor_id), Arc::new(vec![0u8; byte_length]));
+                if let Some(backend) = backends.get(&context_id) {
+                    if let Err(e) = backend.create_tensor(tensor_id, data_type, &shape) {
+                        log::error!("create_tensor({tensor_id}) failed: {e}");
+                    }
+                }
             },
             WebNNRequest::CreateConstantTensor {
                 context_id,
                 tensor_id,
+                data_type,
+                shape,
                 bytes,
             } => {
-                tensor_store.insert((context_id, tensor_id), Arc::new(bytes));
+                if let Some(backend) = backends.get(&context_id) {
+                    if let Err(e) = backend.create_tensor(tensor_id, data_type, &shape) {
+                        log::error!("create_constant_tensor({tensor_id}) failed: {e}");
+                    } else if let Err(e) = backend.write_tensor(tensor_id, &bytes) {
+                        log::error!("create_constant_tensor({tensor_id}) write failed: {e}");
+                    }
+                }
             },
             WebNNRequest::WriteTensor {
                 context_id,
                 tensor_id,
                 bytes,
             } => {
-                tensor_store.insert((context_id, tensor_id), Arc::new(bytes));
+                if let Some(backend) = backends.get(&context_id) {
+                    if let Err(e) = backend.write_tensor(tensor_id, &bytes) {
+                        log::error!("write_tensor({tensor_id}) failed: {e}");
+                    }
+                }
             },
             WebNNRequest::ReadTensor {
                 context_id,
                 tensor_id,
                 callback,
             } => {
-                let bytes = tensor_store
-                    .get(&(context_id, tensor_id))
-                    .map(|buffer| buffer.as_ref().clone())
-                    .ok_or(());
+                let t0 = std::time::Instant::now();
+                let bytes = backends
+                    .get(&context_id)
+                    .map(|backend| backend.read_tensor(tensor_id))
+                    .unwrap_or_else(|| Err("unknown context".to_string()))
+                    .map_err(|_| ());
+                let t1 = std::time::Instant::now();
+                log::error!(
+                    "[webnn-timing] read_handler = {:.2}ms",
+                    (t1 - t0).as_secs_f64() * 1e3
+                );
                 let _ = callback.send(ReadTensorResponse { bytes });
+            },
+            WebNNRequest::DestroyTensor {
+                context_id,
+                tensor_id,
+            } => {
+                log::error!("[webnn-leak] destroy_tensor {:?} {tensor_id}", context_id);
+                if let Some(backend) = backends.get(&context_id) {
+                    backend.destroy_tensor(tensor_id);
+                }
             },
             WebNNRequest::Run {
                 context_id,
@@ -366,33 +419,23 @@ fn run_webnn_thread(receiver: GenericReceiver<WebNNRequest>) {
                 outputs,
                 callback,
             } => {
-                let input_refs: Vec<(String, &[u8])> = inputs
-                    .iter()
-                    .map(|(name, tensor_id)| {
-                        let bytes = tensor_store
-                            .get(&(context_id, *tensor_id))
-                            .map(|buffer| buffer.as_slice())
-                            .unwrap_or(&[]);
-                        (name.clone(), bytes)
-                    })
-                    .collect();
-                let output_labels: Vec<String> =
-                    outputs.iter().map(|(name, _)| name.clone()).collect();
+                let t0 = std::time::Instant::now();
                 let result = backends
                     .get(&context_id)
-                    .map(|backend| backend.run(graph_id, &input_refs, &output_labels))
+                    .map(|backend| backend.run(graph_id, &inputs, &outputs))
                     .unwrap_or_else(|| Err("unknown context".to_string()));
-                if let Ok(run_result) = &result {
-                    for ((_, tensor_id), bytes) in outputs.iter().zip(run_result.outputs.iter()) {
-                        tensor_store.insert((context_id, *tensor_id), Arc::new(bytes.clone()));
-                    }
-                }
+                let t1 = std::time::Instant::now();
+                log::error!(
+                    "[webnn-timing] run = {:.2}ms",
+                    (t1 - t0).as_secs_f64() * 1e3
+                );
                 let _ = callback.send(RunResponse { result });
             },
             WebNNRequest::DestroyGraph {
                 context_id,
                 graph_id,
             } => {
+                log::error!("[webnn-leak] destroy_graph {:?} {graph_id}", context_id);
                 if let Some(backend) = backends.get(&context_id) {
                     backend.destroy_graph(graph_id);
                 }
@@ -498,19 +541,42 @@ impl WebNN {
         });
     }
 
-    pub fn create_tensor(&self, context_id: ContextId, tensor_id: u32, byte_length: usize) {
+    pub fn create_tensor(
+        &self,
+        context_id: ContextId,
+        tensor_id: u32,
+        data_type: u32,
+        shape: &[u32],
+    ) {
         self.0.send_or_warn(WebNNRequest::CreateTensor {
             context_id,
             tensor_id,
-            byte_length,
+            data_type,
+            shape: shape.to_vec(),
         });
     }
 
-    pub fn create_constant_tensor(&self, context_id: ContextId, tensor_id: u32, bytes: Vec<u8>) {
+    pub fn create_constant_tensor(
+        &self,
+        context_id: ContextId,
+        tensor_id: u32,
+        data_type: u32,
+        shape: &[u32],
+        bytes: Vec<u8>,
+    ) {
         self.0.send_or_warn(WebNNRequest::CreateConstantTensor {
             context_id,
             tensor_id,
+            data_type,
+            shape: shape.to_vec(),
             bytes,
+        });
+    }
+
+    pub fn destroy_tensor(&self, context_id: ContextId, tensor_id: u32) {
+        self.0.send_or_warn(WebNNRequest::DestroyTensor {
+            context_id,
+            tensor_id,
         });
     }
 

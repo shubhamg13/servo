@@ -19,8 +19,19 @@ pub enum Operator {
     Sub,
     Mul,
     Div,
+    Max,
+    Min,
     Sigmoid,
+    Relu,
+    Sqrt,
+    Reciprocal,
+    Gelu,
+    LeakyRelu {
+        alpha: f32,
+    },
     Prelu,
+    Matmul,
+    Gemm(GemmOptions),
     Cast {
         /// Target data type as the WebIDL `MLOperandDataType` discriminant.
         output_data_type: u32,
@@ -43,6 +54,12 @@ pub enum Operator {
         sizes: Vec<u32>,
         strides: Vec<u32>,
     },
+    Pad {
+        beginning_padding: Vec<u32>,
+        ending_padding: Vec<u32>,
+        mode: String,
+        value: f32,
+    },
     Split {
         /// Size of each output along `axis`. The DOM layer resolves the spec's
         /// "split into N equal parts" form into explicit sizes.
@@ -50,9 +67,12 @@ pub enum Operator {
         axis: u32,
     },
     Conv2d(Conv2dOptions),
+    ConvTranspose2d(ConvTranspose2dOptions),
     MaxPool2d(Pool2dOptions),
+    AveragePool2d(Pool2dOptions),
     Resample2d(Resample2dOptions),
     ReduceSum(ReduceOptions),
+    ReduceMean(ReduceOptions),
 }
 
 /// <https://www.w3.org/TR/webnn/#dictdef-mlreduceoptions>
@@ -73,6 +93,30 @@ pub struct Conv2dOptions {
     pub input_layout: String,
     pub filter_layout: String,
     pub bias: Option<OperandId>,
+}
+
+/// <https://www.w3.org/TR/webnn/#dictdef-mlconvtranspose2doptions>
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConvTranspose2dOptions {
+    pub padding: Vec<u32>,
+    pub strides: Vec<u32>,
+    pub dilations: Vec<u32>,
+    pub output_padding: Vec<u32>,
+    pub output_sizes: Option<Vec<u32>>,
+    pub groups: u32,
+    pub input_layout: String,
+    pub filter_layout: String,
+    pub bias: Option<OperandId>,
+}
+
+/// <https://www.w3.org/TR/webnn/#dictdef-mlgemmoptions>
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GemmOptions {
+    pub c: Option<OperandId>,
+    pub alpha: f32,
+    pub beta: f32,
+    pub a_transpose: bool,
+    pub b_transpose: bool,
 }
 
 /// <https://www.w3.org/TR/webnn/#dictdef-mlpool2doptions>

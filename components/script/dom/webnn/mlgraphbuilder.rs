@@ -19,10 +19,11 @@ use script_bindings::root::DomRoot;
 use crate::dom::bindings::buffer_source::get_buffer_source_copy;
 use crate::dom::bindings::codegen::Bindings::PermissionStatusBinding::PermissionName;
 use crate::dom::bindings::codegen::Bindings::WebNNBinding::{
-    MLConv2dFilterOperandLayout, MLConv2dOptions, MLGraphBuilderMethods, MLInputOperandLayout,
-    MLInterpolationMode, MLOperandDataType, MLOperandDescriptor, MLOperatorOptions,
-    MLPool2dOptions, MLReduceOptions, MLResample2dOptions, MLRoundingType, MLSliceOptions,
-    MLSplitOptions, MLTransposeOptions,
+    MLConv2dFilterOperandLayout, MLConv2dOptions, MLConvTranspose2dFilterOperandLayout,
+    MLConvTranspose2dOptions, MLGemmOptions, MLGraphBuilderMethods, MLInputOperandLayout,
+    MLInterpolationMode, MLLeakyReluOptions, MLOperandDataType, MLOperandDescriptor,
+    MLOperatorOptions, MLPadOptions, MLPaddingMode, MLPool2dOptions, MLReduceOptions,
+    MLResample2dOptions, MLRoundingType, MLSliceOptions, MLSplitOptions, MLTransposeOptions,
 };
 use crate::dom::bindings::codegen::UnionTypes::{
     MaybeSharedArrayBufferViewOrMaybeSharedArrayBuffer,
@@ -103,6 +104,15 @@ fn filter_layout_str(layout: MLConv2dFilterOperandLayout) -> &'static str {
     }
 }
 
+/// Returns the string form of an `MLConvTranspose2dFilterOperandLayout`.
+fn conv_transpose_filter_layout_str(layout: MLConvTranspose2dFilterOperandLayout) -> &'static str {
+    match layout {
+        MLConvTranspose2dFilterOperandLayout::Iohw => "iohw",
+        MLConvTranspose2dFilterOperandLayout::Hwoi => "hwoi",
+        MLConvTranspose2dFilterOperandLayout::Ohwi => "ohwi",
+    }
+}
+
 /// Returns the string form of an `MLRoundingType`.
 fn rounding_type_str(rounding: MLRoundingType) -> &'static str {
     match rounding {
@@ -119,6 +129,40 @@ fn interpolation_mode_str(mode: MLInterpolationMode) -> &'static str {
     }
 }
 
+/// Returns the string form of an `MLPaddingMode`.
+fn padding_mode_str(mode: MLPaddingMode) -> &'static str {
+    match mode {
+        MLPaddingMode::Constant => "constant",
+        MLPaddingMode::Edge => "edge",
+        MLPaddingMode::Reflection => "reflection",
+        MLPaddingMode::Symmetric => "symmetric",
+    }
+}
+
+/// <https://www.w3.org/TR/webnn/#mlgraphbuilder-pad>
+fn pad_output_shape(
+    input_shape: &[u32],
+    beginning_padding: &[u32],
+    ending_padding: &[u32],
+) -> Result<Vec<u32>, Error> {
+    // Step 1. If beginningPadding's size is not equal to input's rank, then
+    // throw a TypeError.
+    // Step 2. If endingPadding's size is not equal to input's rank, then throw
+    // a TypeError.
+    if beginning_padding.len() != input_shape.len() || ending_padding.len() != input_shape.len() {
+        return Err(Error::Type(
+            c"pad padding length does not match input rank.".to_owned(),
+        ));
+    }
+    // Step 3. The output shape is input's shape with each dimension increased
+    // by the corresponding beginning and ending padding.
+    Ok(input_shape
+        .iter()
+        .zip(beginning_padding.iter().zip(ending_padding.iter()))
+        .map(|(&dim, (&begin, &end))| dim + begin + end)
+        .collect())
+}
+
 /// Computes a single conv/pool output dimension.
 fn conv_dim(
     input: u32,
@@ -127,16 +171,26 @@ fn conv_dim(
     stride: u32,
     dilation: u32,
 ) -> Result<u32, Error> {
-    let numerator = input as i64 + padding as i64 - dilation as i64 * (kernel as i64 - 1) - 1;
+    if stride == 0 || dilation == 0 {
+        return Err(Error::Type(
+            c"Stride and dilation must be greater than 0.".to_owned(),
+        ));
+    }
+    let kernel_extent = (dilation as i64)
+        .checked_mul(kernel as i64 - 1)
+        .ok_or_else(|| Error::Type(c"Kernel extent is too large.".to_owned()))?;
+    let numerator = input as i64 + padding as i64 - kernel_extent - 1;
     if numerator < 0 {
         return Err(Error::Type(
             c"Output dimension is invalid for the given input, kernel, and padding.".to_owned(),
         ));
     }
-    Ok((numerator / stride as i64 + 1) as u32)
+    u32::try_from(numerator / stride as i64 + 1)
+        .map_err(|_| Error::Type(c"Output dimension is too large.".to_owned()))
 }
 
-/// Computes the output shape of a 2D convolution (NCHW).
+/// Computes the output shape of a 2D convolution for the supported input and
+/// filter operand layouts.
 fn conv2d_output_shape(
     input: &[u32],
     filter: &[u32],
@@ -147,33 +201,52 @@ fn conv2d_output_shape(
             c"conv2d requires 4-D input and filter.".to_owned(),
         ));
     }
-    if !matches!(options.inputLayout, MLInputOperandLayout::Nchw) {
-        return Err(Error::NotSupported(Some(
-            "Only the 'nchw' conv2d input layout is supported.".to_owned(),
-        )));
-    }
     let strides = options.strides.clone().unwrap_or_else(|| vec![1, 1]);
     let dilations = options.dilations.clone().unwrap_or_else(|| vec![1, 1]);
     let padding = options.padding.clone().unwrap_or_else(|| vec![0, 0, 0, 0]);
     if strides.len() != 2 || dilations.len() != 2 || padding.len() != 4 {
         return Err(Error::Type(c"Invalid conv2d options.".to_owned()));
     }
-    let output_channels = filter[0];
+
+    // The input spatial dimensions depend on the input layout; NHWC stores
+    // channels last.
+    let (input_h, input_w) = match options.inputLayout {
+        MLInputOperandLayout::Nchw => (input[2], input[3]),
+        MLInputOperandLayout::Nhwc => (input[1], input[2]),
+    };
+
+    // The output channel count and filter spatial dimensions depend on the
+    // filter layout.
+    let (output_channels, filter_h, filter_w) = match options.filterLayout {
+        MLConv2dFilterOperandLayout::Oihw => (filter[0], filter[2], filter[3]),
+        MLConv2dFilterOperandLayout::Hwio => (filter[3], filter[0], filter[1]),
+        MLConv2dFilterOperandLayout::Ohwi => (filter[0], filter[1], filter[2]),
+        MLConv2dFilterOperandLayout::Ihwo => (filter[3], filter[1], filter[2]),
+    };
+
     let output_height = conv_dim(
-        input[2],
-        filter[2],
+        input_h,
+        filter_h,
         padding[0] + padding[1],
         strides[0],
         dilations[0],
     )?;
     let output_width = conv_dim(
-        input[3],
-        filter[3],
+        input_w,
+        filter_w,
         padding[2] + padding[3],
         strides[1],
         dilations[1],
     )?;
-    Ok(vec![input[0], output_channels, output_height, output_width])
+
+    match options.inputLayout {
+        MLInputOperandLayout::Nchw => {
+            Ok(vec![input[0], output_channels, output_height, output_width])
+        },
+        MLInputOperandLayout::Nhwc => {
+            Ok(vec![input[0], output_height, output_width, output_channels])
+        },
+    }
 }
 
 /// Computes a single pooling output dimension.
@@ -185,7 +258,15 @@ fn pool_dim(
     dilation: u32,
     ceil: bool,
 ) -> Result<u32, Error> {
-    let numerator = input as i64 + padding as i64 - dilation as i64 * (window as i64 - 1) - 1;
+    if stride == 0 || dilation == 0 {
+        return Err(Error::Type(
+            c"Stride and dilation must be greater than 0.".to_owned(),
+        ));
+    }
+    let window_extent = (dilation as i64)
+        .checked_mul(window as i64 - 1)
+        .ok_or_else(|| Error::Type(c"Window extent is too large.".to_owned()))?;
+    let numerator = input as i64 + padding as i64 - window_extent - 1;
     if numerator < 0 {
         return Err(Error::Type(
             c"Output dimension is invalid for the given input, window, and padding.".to_owned(),
@@ -196,18 +277,14 @@ fn pool_dim(
     } else {
         numerator / stride as i64 + 1
     };
-    Ok(dim as u32)
+    u32::try_from(dim).map_err(|_| Error::Type(c"Output dimension is too large.".to_owned()))
 }
 
-/// Computes the output shape of a 2D pooling operation (NCHW).
+/// Computes the output shape of a 2D pooling operation for the supported
+/// layouts.
 fn pool2d_output_shape(input: &[u32], options: &MLPool2dOptions) -> Result<Vec<u32>, Error> {
     if input.len() != 4 {
         return Err(Error::Type(c"pool2d requires a 4-D input.".to_owned()));
-    }
-    if !matches!(options.layout, MLInputOperandLayout::Nchw) {
-        return Err(Error::NotSupported(Some(
-            "Only the 'nchw' pool2d layout is supported.".to_owned(),
-        )));
     }
     let window = options.windowDimensions.clone().unwrap_or_default();
     if window.len() != 2 {
@@ -221,23 +298,34 @@ fn pool2d_output_shape(input: &[u32], options: &MLPool2dOptions) -> Result<Vec<u
     if strides.len() != 2 || dilations.len() != 2 || padding.len() != 4 {
         return Err(Error::Type(c"Invalid pool2d options.".to_owned()));
     }
+
+    // The spatial dimensions depend on the layout; NHWC stores channels last.
+    let (input_h, input_w) = match options.layout {
+        MLInputOperandLayout::Nchw => (input[2], input[3]),
+        MLInputOperandLayout::Nhwc => (input[1], input[2]),
+    };
+
     let (output_height, output_width) = match &options.outputSizes {
         Some(sizes) if sizes.len() == 2 => (sizes[0], sizes[1]),
         _ => {
             let ceil = matches!(options.outputShapeRounding, MLRoundingType::Ceil);
             (
                 pool_dim(
-                    input[2],
+                    input_h,
                     window[0],
-                    padding[0] + padding[1],
+                    padding[0]
+                        .checked_add(padding[1])
+                        .ok_or_else(|| Error::Type(c"Padding is too large.".to_owned()))?,
                     strides[0],
                     dilations[0],
                     ceil,
                 )?,
                 pool_dim(
-                    input[3],
+                    input_w,
                     window[1],
-                    padding[2] + padding[3],
+                    padding[2]
+                        .checked_add(padding[3])
+                        .ok_or_else(|| Error::Type(c"Padding is too large.".to_owned()))?,
                     strides[1],
                     dilations[1],
                     ceil,
@@ -245,7 +333,11 @@ fn pool2d_output_shape(input: &[u32], options: &MLPool2dOptions) -> Result<Vec<u
             )
         },
     };
-    Ok(vec![input[0], input[1], output_height, output_width])
+
+    match options.layout {
+        MLInputOperandLayout::Nchw => Ok(vec![input[0], input[1], output_height, output_width]),
+        MLInputOperandLayout::Nhwc => Ok(vec![input[0], output_height, output_width, input[3]]),
+    }
 }
 
 /// Computes the output shape of `resample2d` (NCHW).
@@ -256,21 +348,33 @@ fn resample2d_output_shape(
     if input.len() != 4 {
         return Err(Error::Type(c"resample2d requires a 4-D input.".to_owned()));
     }
+    // The spatial axes to resize default to the last two axes (NCHW).
+    let axes = options.axes.clone().unwrap_or_else(|| vec![2, 3]);
+    if axes.len() != 2 {
+        return Err(Error::Type(c"resample2d requires 2 axes.".to_owned()));
+    }
+    let (axis_h, axis_w) = (axes[0] as usize, axes[1] as usize);
+    if axis_h >= input.len() || axis_w >= input.len() {
+        return Err(Error::Type(c"resample2d axis is out of bounds.".to_owned()));
+    }
+    let mut output = input.to_vec();
     if let Some(sizes) = &options.sizes {
         if sizes.len() != 2 {
             return Err(Error::Type(
                 c"resample2d requires 2 output sizes.".to_owned(),
             ));
         }
-        return Ok(vec![input[0], input[1], sizes[0], sizes[1]]);
+        output[axis_h] = sizes[0];
+        output[axis_w] = sizes[1];
+        return Ok(output);
     }
     if let Some(scales) = &options.scales {
         if scales.len() != 2 {
             return Err(Error::Type(c"resample2d requires 2 scales.".to_owned()));
         }
-        let output_height = (input[2] as f32 * (*scales[0])).floor() as u32;
-        let output_width = (input[3] as f32 * (*scales[1])).floor() as u32;
-        return Ok(vec![input[0], input[1], output_height, output_width]);
+        output[axis_h] = (output[axis_h] as f32 * (*scales[0])).floor() as u32;
+        output[axis_w] = (output[axis_w] as f32 * (*scales[1])).floor() as u32;
+        return Ok(output);
     }
     Err(Error::Type(
         c"resample2d requires either sizes or scales.".to_owned(),
@@ -455,6 +559,150 @@ fn reduce_shape(
         }
     }
     Ok(output)
+}
+
+/// Computes the output shape of `matmul`, broadcasting batch dimensions.
+fn matmul_output_shape(a: &[u32], b: &[u32]) -> Result<Vec<u32>, Error> {
+    if a.len() < 2 || b.len() < 2 {
+        return Err(Error::Type(
+            c"matmul requires at least 2-D inputs.".to_owned(),
+        ));
+    }
+    let (m, k_a) = (a[a.len() - 2], a[a.len() - 1]);
+    let (k_b, n) = (b[b.len() - 2], b[b.len() - 1]);
+    if k_a != k_b {
+        return Err(Error::Type(
+            c"matmul inner dimensions do not match.".to_owned(),
+        ));
+    }
+    let mut output = bidirectionally_broadcast(&a[..a.len() - 2], &b[..b.len() - 2])
+        .map_err(|_| Error::Type(c"matmul batch dimensions are not broadcastable.".to_owned()))?;
+    output.push(m);
+    output.push(n);
+    Ok(output)
+}
+
+/// Computes the output shape of `gemm` (2-D `[M, N]`).
+fn gemm_output_shape(a: &[u32], b: &[u32], options: &MLGemmOptions) -> Result<Vec<u32>, Error> {
+    if a.len() != 2 || b.len() != 2 {
+        return Err(Error::Type(c"gemm requires 2-D inputs.".to_owned()));
+    }
+    let (m, k_a) = if options.aTranspose {
+        (a[1], a[0])
+    } else {
+        (a[0], a[1])
+    };
+    let (k_b, n) = if options.bTranspose {
+        (b[1], b[0])
+    } else {
+        (b[0], b[1])
+    };
+    if k_a != k_b {
+        return Err(Error::Type(
+            c"gemm inner dimensions do not match.".to_owned(),
+        ));
+    }
+    Ok(vec![m, n])
+}
+
+/// Computes the output shape of a 2D transposed convolution.
+fn conv_transpose2d_output_shape(
+    input: &[u32],
+    filter: &[u32],
+    options: &MLConvTranspose2dOptions,
+) -> Result<Vec<u32>, Error> {
+    if input.len() != 4 || filter.len() != 4 {
+        return Err(Error::Type(
+            c"convTranspose2d requires 4-D input and filter.".to_owned(),
+        ));
+    }
+    let strides = options.strides.clone().unwrap_or_else(|| vec![1, 1]);
+    let dilations = options.dilations.clone().unwrap_or_else(|| vec![1, 1]);
+    let padding = options.padding.clone().unwrap_or_else(|| vec![0, 0, 0, 0]);
+    let output_padding = options.outputPadding.clone().unwrap_or_default();
+    if strides.len() != 2 || dilations.len() != 2 || padding.len() != 4 {
+        return Err(Error::Type(c"Invalid convTranspose2d options.".to_owned()));
+    }
+    let output_padding = if output_padding.is_empty() {
+        vec![0, 0]
+    } else if output_padding.len() == 2 {
+        output_padding
+    } else {
+        return Err(Error::Type(
+            c"convTranspose2d outputPadding must have 2 values.".to_owned(),
+        ));
+    };
+
+    let (batch, input_h, input_w) = match options.inputLayout {
+        MLInputOperandLayout::Nchw => (input[0], input[2], input[3]),
+        MLInputOperandLayout::Nhwc => (input[0], input[1], input[2]),
+    };
+
+    // Output channels (per group) and kernel dims depend on the filter layout.
+    let (out_channels_per_group, kernel_h, kernel_w) = match options.filterLayout {
+        MLConvTranspose2dFilterOperandLayout::Iohw => (filter[1], filter[2], filter[3]),
+        MLConvTranspose2dFilterOperandLayout::Ohwi => (filter[0], filter[1], filter[2]),
+        MLConvTranspose2dFilterOperandLayout::Hwoi => (filter[2], filter[0], filter[1]),
+    };
+    let groups = if options.groups == 0 {
+        1
+    } else {
+        options.groups
+    };
+    let output_channels = out_channels_per_group
+        .checked_mul(groups)
+        .ok_or_else(|| Error::Type(c"Output channels are too large.".to_owned()))?;
+
+    if strides[0] == 0 || strides[1] == 0 || dilations[0] == 0 || dilations[1] == 0 {
+        return Err(Error::Type(
+            c"Stride and dilation must be greater than 0.".to_owned(),
+        ));
+    }
+    let effective_kernel_h = (dilations[0] as i64) * (kernel_h as i64 - 1) + 1;
+    let effective_kernel_w = (dilations[1] as i64) * (kernel_w as i64 - 1) + 1;
+
+    let output_extent = |input: u32,
+                         effective_kernel: i64,
+                         stride: u32,
+                         pad_begin: u32,
+                         pad_end: u32,
+                         output_padding: u32|
+     -> Result<u32, Error> {
+        let extent = (input as i64 - 1) * stride as i64 + effective_kernel - pad_begin as i64
+            - pad_end as i64
+            + output_padding as i64;
+        u32::try_from(extent).map_err(|_| {
+            Error::Type(c"Output dimension is invalid for the given options.".to_owned())
+        })
+    };
+
+    let output_h = match &options.outputSizes {
+        Some(sizes) if sizes.len() == 2 => sizes[0],
+        _ => output_extent(
+            input_h,
+            effective_kernel_h,
+            strides[0],
+            padding[0],
+            padding[1],
+            output_padding[0],
+        )?,
+    };
+    let output_w = match &options.outputSizes {
+        Some(sizes) if sizes.len() == 2 => sizes[1],
+        _ => output_extent(
+            input_w,
+            effective_kernel_w,
+            strides[1],
+            padding[2],
+            padding[3],
+            output_padding[1],
+        )?,
+    };
+
+    match options.inputLayout {
+        MLInputOperandLayout::Nchw => Ok(vec![batch, output_channels, output_h, output_w]),
+        MLInputOperandLayout::Nhwc => Ok(vec![batch, output_h, output_w, output_channels]),
+    }
 }
 
 /// <https://www.w3.org/TR/webnn/#mlgraphbuilder>
@@ -955,6 +1203,104 @@ impl MLGraphBuilderMethods<crate::DomTypeHolder> for MLGraphBuilder {
         self.create_element_wise_binary(cx, webnn::Operator::Div, a, b, options)
     }
 
+    /// <https://www.w3.org/TR/webnn/#dom-mlgraphbuilder-min>
+    fn Min(
+        &self,
+        cx: &mut JSContext,
+        a: &MLOperand,
+        b: &MLOperand,
+        options: &MLOperatorOptions,
+    ) -> Result<DomRoot<MLOperand>, Error> {
+        self.create_element_wise_binary(cx, webnn::Operator::Min, a, b, options)
+    }
+
+    /// <https://www.w3.org/TR/webnn/#dom-mlgraphbuilder-max>
+    fn Max(
+        &self,
+        cx: &mut JSContext,
+        a: &MLOperand,
+        b: &MLOperand,
+        options: &MLOperatorOptions,
+    ) -> Result<DomRoot<MLOperand>, Error> {
+        self.create_element_wise_binary(cx, webnn::Operator::Max, a, b, options)
+    }
+
+    /// <https://www.w3.org/TR/webnn/#dom-mlgraphbuilder-matmul>
+    fn Matmul(
+        &self,
+        cx: &mut JSContext,
+        a: &MLOperand,
+        b: &MLOperand,
+        options: &MLOperatorOptions,
+    ) -> Result<DomRoot<MLOperand>, Error> {
+        // Step 1. If this cannot build, throw an "InvalidStateError" DOMException.
+        if !self.can_build() {
+            return Err(Error::InvalidState(Some("Cannot build.".to_owned())));
+        }
+        // Step 2. Validate the operands.
+        if !validate_operand(self, a) || !validate_operand(self, b) {
+            return Err(Error::Type(c"Input is from another builder.".to_owned()));
+        }
+        // Step 3. If a's dataType is not equal to b's dataType, throw a TypeError.
+        if a.data_type() != b.data_type() {
+            return Err(Error::Type(
+                c"Inputs must have the same data type.".to_owned(),
+            ));
+        }
+        let output_shape = matmul_output_shape(a.shape(), b.shape())?;
+        Ok(self.add_single_output_operator(
+            cx,
+            webnn::Operator::Matmul,
+            &[a.operand_id(), b.operand_id()],
+            a.data_type(),
+            output_shape,
+            options.label.0.as_str(),
+        ))
+    }
+
+    /// <https://www.w3.org/TR/webnn/#dom-mlgraphbuilder-gemm>
+    fn Gemm(
+        &self,
+        cx: &mut JSContext,
+        a: &MLOperand,
+        b: &MLOperand,
+        options: &MLGemmOptions,
+    ) -> Result<DomRoot<MLOperand>, Error> {
+        // Step 1. If this cannot build, throw an "InvalidStateError" DOMException.
+        if !self.can_build() {
+            return Err(Error::InvalidState(Some("Cannot build.".to_owned())));
+        }
+        // Step 2. Validate the operands.
+        if !validate_operand(self, a) || !validate_operand(self, b) {
+            return Err(Error::Type(c"Input is from another builder.".to_owned()));
+        }
+        if a.data_type() != b.data_type() {
+            return Err(Error::Type(
+                c"Inputs must have the same data type.".to_owned(),
+            ));
+        }
+        if let Some(c) = &options.c {
+            if !validate_operand(self, c) {
+                return Err(Error::Type(c"gemm c is from another builder.".to_owned()));
+            }
+        }
+        let output_shape = gemm_output_shape(a.shape(), b.shape(), options)?;
+        Ok(self.add_single_output_operator(
+            cx,
+            webnn::Operator::Gemm(webnn::GemmOptions {
+                c: options.c.as_ref().map(|operand| operand.operand_id()),
+                alpha: *options.alpha,
+                beta: *options.beta,
+                a_transpose: options.aTranspose,
+                b_transpose: options.bTranspose,
+            }),
+            &[a.operand_id(), b.operand_id()],
+            a.data_type(),
+            output_shape,
+            options.parent.label.0.as_str(),
+        ))
+    }
+
     /// <https://www.w3.org/TR/webnn/#dom-mlgraphbuilder-prelu>
     fn Prelu(
         &self,
@@ -974,6 +1320,75 @@ impl MLGraphBuilderMethods<crate::DomTypeHolder> for MLGraphBuilder {
         options: &MLOperatorOptions,
     ) -> Result<DomRoot<MLOperand>, Error> {
         self.create_element_wise_unary(cx, webnn::Operator::Sigmoid, input, options)
+    }
+
+    /// <https://www.w3.org/TR/webnn/#dom-mlgraphbuilder-relu>
+    fn Relu(
+        &self,
+        cx: &mut JSContext,
+        input: &MLOperand,
+        options: &MLOperatorOptions,
+    ) -> Result<DomRoot<MLOperand>, Error> {
+        self.create_element_wise_unary(cx, webnn::Operator::Relu, input, options)
+    }
+
+    /// <https://www.w3.org/TR/webnn/#dom-mlgraphbuilder-sqrt>
+    fn Sqrt(
+        &self,
+        cx: &mut JSContext,
+        input: &MLOperand,
+        options: &MLOperatorOptions,
+    ) -> Result<DomRoot<MLOperand>, Error> {
+        self.create_element_wise_unary(cx, webnn::Operator::Sqrt, input, options)
+    }
+
+    /// <https://www.w3.org/TR/webnn/#dom-mlgraphbuilder-reciprocal>
+    fn Reciprocal(
+        &self,
+        cx: &mut JSContext,
+        input: &MLOperand,
+        options: &MLOperatorOptions,
+    ) -> Result<DomRoot<MLOperand>, Error> {
+        self.create_element_wise_unary(cx, webnn::Operator::Reciprocal, input, options)
+    }
+
+    /// <https://www.w3.org/TR/webnn/#dom-mlgraphbuilder-gelu>
+    fn Gelu(
+        &self,
+        cx: &mut JSContext,
+        input: &MLOperand,
+        options: &MLOperatorOptions,
+    ) -> Result<DomRoot<MLOperand>, Error> {
+        self.create_element_wise_unary(cx, webnn::Operator::Gelu, input, options)
+    }
+
+    /// <https://www.w3.org/TR/webnn/#dom-mlgraphbuilder-leakyrelu>
+    fn LeakyRelu(
+        &self,
+        cx: &mut JSContext,
+        input: &MLOperand,
+        options: &MLLeakyReluOptions,
+    ) -> Result<DomRoot<MLOperand>, Error> {
+        // Step 1. If this cannot build, throw an "InvalidStateError" DOMException.
+        if !self.can_build() {
+            return Err(Error::InvalidState(Some("Cannot build.".to_owned())));
+        }
+        // Step 2. Validate the operand.
+        if !validate_operand(self, input) {
+            return Err(Error::Type(c"Input is from another builder.".to_owned()));
+        }
+        // Step 3. The output has the same shape and data type as the input.
+        let shape = input.shape().to_vec();
+        Ok(self.add_single_output_operator(
+            cx,
+            webnn::Operator::LeakyRelu {
+                alpha: *options.alpha,
+            },
+            &[input.operand_id()],
+            input.data_type(),
+            shape,
+            options.parent.label.0.as_str(),
+        ))
     }
 
     /// <https://www.w3.org/TR/webnn/#dom-mlgraphbuilder-cast>
@@ -1108,6 +1523,57 @@ impl MLGraphBuilderMethods<crate::DomTypeHolder> for MLGraphBuilder {
         ))
     }
 
+    /// <https://www.w3.org/TR/webnn/#dom-mlgraphbuilder-convtranspose2d>
+    fn ConvTranspose2d(
+        &self,
+        cx: &mut JSContext,
+        input: &MLOperand,
+        filter: &MLOperand,
+        options: &MLConvTranspose2dOptions,
+    ) -> Result<DomRoot<MLOperand>, Error> {
+        // Step 1. If this cannot build, throw an "InvalidStateError" DOMException.
+        if !self.can_build() {
+            return Err(Error::InvalidState(Some("Cannot build.".to_owned())));
+        }
+        // Step 2. Validate the operands.
+        if !validate_operand(self, input) || !validate_operand(self, filter) {
+            return Err(Error::Type(c"Input is from another builder.".to_owned()));
+        }
+        if input.data_type() != filter.data_type() {
+            return Err(Error::Type(
+                c"convTranspose2d input and filter must have the same data type.".to_owned(),
+            ));
+        }
+        if let Some(bias) = &options.bias {
+            if !validate_operand(self, bias) {
+                return Err(Error::Type(
+                    c"convTranspose2d bias is from another builder.".to_owned(),
+                ));
+            }
+        }
+        let output_shape = conv_transpose2d_output_shape(input.shape(), filter.shape(), options)?;
+        let backend_options = webnn::ConvTranspose2dOptions {
+            padding: options.padding.clone().unwrap_or_else(|| vec![0, 0, 0, 0]),
+            strides: options.strides.clone().unwrap_or_else(|| vec![1, 1]),
+            dilations: options.dilations.clone().unwrap_or_else(|| vec![1, 1]),
+            output_padding: options.outputPadding.clone().unwrap_or_default(),
+            output_sizes: options.outputSizes.clone(),
+            groups: options.groups,
+            input_layout: input_layout_str(options.inputLayout).to_string(),
+            filter_layout: conv_transpose_filter_layout_str(options.filterLayout).to_string(),
+            bias: options.bias.as_ref().map(|operand| operand.operand_id()),
+        };
+        let input_ids = [input.operand_id(), filter.operand_id()];
+        Ok(self.add_single_output_operator(
+            cx,
+            webnn::Operator::ConvTranspose2d(backend_options),
+            &input_ids,
+            input.data_type(),
+            output_shape,
+            options.parent.label.0.as_str(),
+        ))
+    }
+
     /// <https://www.w3.org/TR/webnn/#dom-mlgraphbuilder-maxpool2d>
     fn MaxPool2d(
         &self,
@@ -1136,6 +1602,75 @@ impl MLGraphBuilderMethods<crate::DomTypeHolder> for MLGraphBuilder {
         Ok(self.add_single_output_operator(
             cx,
             webnn::Operator::MaxPool2d(backend_options),
+            &[input.operand_id()],
+            input.data_type(),
+            output_shape,
+            options.parent.label.0.as_str(),
+        ))
+    }
+
+    /// <https://www.w3.org/TR/webnn/#dom-mlgraphbuilder-averagepool2d>
+    fn AveragePool2d(
+        &self,
+        cx: &mut JSContext,
+        input: &MLOperand,
+        options: &MLPool2dOptions,
+    ) -> Result<DomRoot<MLOperand>, Error> {
+        // Step 1. If this cannot build, throw an "InvalidStateError" DOMException.
+        if !self.can_build() {
+            return Err(Error::InvalidState(Some("Cannot build.".to_owned())));
+        }
+        // Step 2. Validate the operand.
+        if !validate_operand(self, input) {
+            return Err(Error::Type(c"Input is from another builder.".to_owned()));
+        }
+        let output_shape = pool2d_output_shape(input.shape(), options)?;
+        let backend_options = webnn::Pool2dOptions {
+            window_dimensions: options.windowDimensions.clone().unwrap_or_default(),
+            padding: options.padding.clone().unwrap_or_else(|| vec![0, 0, 0, 0]),
+            strides: options.strides.clone().unwrap_or_else(|| vec![1, 1]),
+            dilations: options.dilations.clone().unwrap_or_else(|| vec![1, 1]),
+            layout: input_layout_str(options.layout).to_string(),
+            output_shape_rounding: rounding_type_str(options.outputShapeRounding).to_string(),
+            output_sizes: options.outputSizes.clone(),
+        };
+        Ok(self.add_single_output_operator(
+            cx,
+            webnn::Operator::AveragePool2d(backend_options),
+            &[input.operand_id()],
+            input.data_type(),
+            output_shape,
+            options.parent.label.0.as_str(),
+        ))
+    }
+
+    /// <https://www.w3.org/TR/webnn/#dom-mlgraphbuilder-pad>
+    fn Pad(
+        &self,
+        cx: &mut JSContext,
+        input: &MLOperand,
+        beginning_padding: Vec<u32>,
+        ending_padding: Vec<u32>,
+        options: &MLPadOptions,
+    ) -> Result<DomRoot<MLOperand>, Error> {
+        // Step 1. If this cannot build, throw an "InvalidStateError" DOMException.
+        if !self.can_build() {
+            return Err(Error::InvalidState(Some("Cannot build.".to_owned())));
+        }
+        // Step 2. Validate the operand.
+        if !validate_operand(self, input) {
+            return Err(Error::Type(c"Input is from another builder.".to_owned()));
+        }
+        // Step 3. Compute the output shape from the padding.
+        let output_shape = pad_output_shape(input.shape(), &beginning_padding, &ending_padding)?;
+        Ok(self.add_single_output_operator(
+            cx,
+            webnn::Operator::Pad {
+                beginning_padding,
+                ending_padding,
+                mode: padding_mode_str(options.mode).to_string(),
+                value: *options.value,
+            },
             &[input.operand_id()],
             input.data_type(),
             output_shape,
@@ -1365,6 +1900,36 @@ impl MLGraphBuilderMethods<crate::DomTypeHolder> for MLGraphBuilder {
         Ok(self.add_single_output_operator(
             cx,
             webnn::Operator::ReduceSum(webnn::ReduceOptions {
+                axes,
+                keep_dimensions: options.keepDimensions,
+            }),
+            &[input.operand_id()],
+            input.data_type(),
+            output_shape,
+            options.parent.label.0.as_str(),
+        ))
+    }
+
+    /// <https://www.w3.org/TR/webnn/#dom-mlgraphbuilder-reducemean>
+    fn ReduceMean(
+        &self,
+        cx: &mut JSContext,
+        input: &MLOperand,
+        options: &MLReduceOptions,
+    ) -> Result<DomRoot<MLOperand>, Error> {
+        // Step 1. If this cannot build, throw an "InvalidStateError" DOMException.
+        if !self.can_build() {
+            return Err(Error::InvalidState(Some("Cannot build.".to_owned())));
+        }
+        // Step 2. Validate the operand.
+        if !validate_operand(self, input) {
+            return Err(Error::Type(c"Input is from another builder.".to_owned()));
+        }
+        let axes = options.axes.clone().unwrap_or_default();
+        let output_shape = reduce_shape(input.shape(), &axes, options.keepDimensions)?;
+        Ok(self.add_single_output_operator(
+            cx,
+            webnn::Operator::ReduceMean(webnn::ReduceOptions {
                 axes,
                 keep_dimensions: options.keepDimensions,
             }),

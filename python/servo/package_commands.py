@@ -260,6 +260,23 @@ class PackageCommands(CommandBase):
             # into the app folder heirarchy where hvigor expects it.
             print(f"Copying {binary_path} to {ohos_libs_dir}")
             shutil.copy(binary_path, ohos_libs_dir)
+            # Bundle the WebNN accelerator runtimes into the HAP so they land
+            # next to libservoshell.so in the app's native lib dir. Without
+            # this they have to be pushed by hand after every install.
+            accelerator_lib_dirs = [
+                # HiAI / CANN NPU runtime.
+                path.join(env.get("CANN_DDK", ""), "ai_ddk_lib", "lib64"),
+                # LiteRT CPU/GPU runtime (locally built for OHOS).
+                env.get("LITERT_OHOS_LIB_DIR", ""),
+            ]
+            for lib_dir in accelerator_lib_dirs:
+                if not lib_dir or not path.isdir(lib_dir):
+                    continue
+                for name in sorted(os.listdir(lib_dir)):
+                    if ".so" not in name:
+                        continue
+                    print(f"Bundling {name} from {lib_dir}")
+                    shutil.copy(path.join(lib_dir, name), ohos_libs_dir)
             try:
                 with cd(ohos_target_dir):
                     print("Calling", hvigor_command)

@@ -6,6 +6,7 @@ use crossbeam_channel::{Receiver, select};
 use devtools_traits::DevtoolScriptControlMsg;
 use rustc_hash::FxHashSet;
 use script_bindings::reflector::DomObject;
+use js::rust::wrappers2::JS_MaybeGC;
 use servo_base::generic_channel::RoutedReceiver;
 use servo_constellation_traits::WorkerAnimationFrameTick;
 
@@ -41,6 +42,7 @@ pub(crate) trait WorkerEventLoopMethods {
 }
 
 // https://html.spec.whatwg.org/multipage/#worker-event-loop
+#[expect(unsafe_code)]
 pub(crate) fn run_worker_event_loop<T, WorkerMsg, Event>(
     worker_scope: &T,
     worker: Option<&TrustedWorkerAddress>,
@@ -131,4 +133,10 @@ pub(crate) fn run_worker_event_loop<T, WorkerMsg, Event>(
     worker_scope
         .upcast::<GlobalScope>()
         .perform_a_dom_garbage_collection_checkpoint();
+
+    // Nudge the JS GC once per worker event-loop batch (see the equivalent
+    // hook in `script_thread::handle_msgs`).
+    unsafe {
+        JS_MaybeGC(cx);
+    }
 }

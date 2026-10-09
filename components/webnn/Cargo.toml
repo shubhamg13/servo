@@ -14,13 +14,36 @@ name = "webnn"
 
 [features]
 default = []
-rustnn = ["dep:rustnn", "rustnn/onnx-runtime"]
-cann = ["dep:rustnn", "rustnn/cann-runtime"]
+rustnn = ["dep:rustnn"]
+
+# `rustnn/coreml-runtime` is deliberately NOT enabled. Turning it on makes
+# rustnn's `MLGraph` non-`Send` (`CoremlGraph` holds an objc-backed
+# `CompiledCoremlModel`, and `unsafe impl Send` exists only for the LiteRT
+# types), which breaks this crate's `Backend: Send + 'static` bound — on
+# macOS as much as anywhere else, so it is not a target-gating problem.
+# Enable it once rustnn marks the CoreML graph `Send`.
+#
+# Backend *selection* is not a Servo concern: a build compiles in the backends
+# that exist on its target, and rustnn's `backend_selection` picks among them
+# from the requested options. LiteRT covers CPU and GPU everywhere and ONNX
+# Runtime is the last-resort fallback; CANN (HiAI NPU) exists only on
+# OpenHarmony, hence the target-scoped dependency below.
 
 [dependencies]
 bytemuck = { workspace = true }
 half = { workspace = true, features = ["bytemuck"] }
 log = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 servo-base = { workspace = true }
-rustnn = { path = "../../../../rustnn", default-features = false, optional = true }
+rustnn = { git = "https://github.com/shubhamg13/rustnn", rev = "ba3a6eec1b5ad6bb64685c5461cec60fbb2a98c6", default-features = false, optional = true }
+
+# OpenHarmony: LiteRT for CPU/GPU plus CANN for the HiAI NPU. No ONNX Runtime —
+# it has no OpenHarmony build, and this target never compiled it.
+[target.'cfg(target_env = "ohos")'.dependencies]
+rustnn = { git = "https://github.com/shubhamg13/rustnn", rev = "ba3a6eec1b5ad6bb64685c5461cec60fbb2a98c6", default-features = false, optional = true, features = ["litert-runtime", "cann-runtime"] }
+
+# Everywhere else: LiteRT for CPU/GPU, with ONNX Runtime as the last-resort
+# fallback. (CoreML would join this list once rustnn marks its graph `Send`.)
+[target.'cfg(not(target_env = "ohos"))'.dependencies]
+rustnn = { git = "https://github.com/shubhamg13/rustnn", rev = "ba3a6eec1b5ad6bb64685c5461cec60fbb2a98c6", default-features = false, optional = true, features = ["litert-runtime", "onnx-runtime"] }

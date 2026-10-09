@@ -19,7 +19,15 @@ enum MLPowerPreference {
   "low-power"
 };
 
+// https://www.w3.org/TR/webnn/#enumdef-mldevicetype
+enum MLDeviceType {
+  "cpu",
+  "gpu",
+  "npu"
+};
+
 dictionary MLContextOptions {
+  MLDeviceType deviceType = "cpu";
   MLPowerPreference powerPreference = "default";
   boolean accelerated = true;
 };
@@ -153,6 +161,12 @@ enum MLConv2dFilterOperandLayout {
   "ihwo"
 };
 
+enum MLConvTranspose2dFilterOperandLayout {
+  "iohw",
+  "hwoi",
+  "ohwi"
+};
+
 enum MLRoundingType {
   "floor",
   "ceil"
@@ -161,6 +175,13 @@ enum MLRoundingType {
 enum MLInterpolationMode {
   "nearest-neighbor",
   "linear"
+};
+
+enum MLPaddingMode {
+  "constant",
+  "edge",
+  "reflection",
+  "symmetric"
 };
 
 dictionary MLConv2dOptions : MLOperatorOptions {
@@ -207,16 +228,48 @@ dictionary MLReduceOptions : MLOperatorOptions {
   boolean keepDimensions = false;
 };
 
+dictionary MLPadOptions : MLOperatorOptions {
+  MLPaddingMode mode = "constant";
+  float value = 0;
+};
+
+dictionary MLLeakyReluOptions : MLOperatorOptions {
+  float alpha = 0.01;
+};
+
+dictionary MLGemmOptions : MLOperatorOptions {
+  MLOperand c;
+  float alpha = 1.0;
+  float beta = 1.0;
+  boolean aTranspose = false;
+  boolean bTranspose = false;
+};
+
+dictionary MLConvTranspose2dOptions : MLOperatorOptions {
+  sequence<[EnforceRange] unsigned long> padding;
+  sequence<[EnforceRange] unsigned long> strides;
+  sequence<[EnforceRange] unsigned long> dilations;
+  sequence<[EnforceRange] unsigned long> outputPadding;
+  sequence<[EnforceRange] unsigned long> outputSizes;
+  [EnforceRange] unsigned long groups = 1;
+  MLInputOperandLayout inputLayout = "nchw";
+  MLConvTranspose2dFilterOperandLayout filterLayout = "iohw";
+  MLOperand bias;
+};
+
 partial interface MLGraphBuilder {
   [Throws] MLOperand sub(MLOperand a, MLOperand b, optional MLOperatorOptions options = {});
   [Throws] MLOperand mul(MLOperand a, MLOperand b, optional MLOperatorOptions options = {});
   [Throws] MLOperand div(MLOperand a, MLOperand b, optional MLOperatorOptions options = {});
   [Throws] MLOperand prelu(MLOperand input, MLOperand slope, optional MLOperatorOptions options = {});
+  [Throws] MLOperand relu(MLOperand input, optional MLOperatorOptions options = {});
   [Throws] MLOperand sigmoid(MLOperand input, optional MLOperatorOptions options = {});
   [Throws] MLOperand cast(MLOperand input, MLOperandDataType outputDataType, optional MLOperatorOptions options = {});
   [Throws] MLOperand concat(sequence<MLOperand> inputs, [EnforceRange] unsigned long axis, optional MLOperatorOptions options = {});
   [Throws] MLOperand conv2d(MLOperand input, MLOperand filter, optional MLConv2dOptions options = {});
   [Throws] MLOperand maxPool2d(MLOperand input, optional MLPool2dOptions options = {});
+  [Throws] MLOperand averagePool2d(MLOperand input, optional MLPool2dOptions options = {});
+  [Throws] MLOperand pad(MLOperand input, sequence<[EnforceRange] unsigned long> beginningPadding, sequence<[EnforceRange] unsigned long> endingPadding, optional MLPadOptions options = {});
   [Throws] MLOperand reshape(MLOperand input, sequence<[EnforceRange] long> newShape, optional MLOperatorOptions options = {});
   [Throws] MLOperand resample2d(MLOperand input, optional MLResample2dOptions options = {});
   [Throws] MLOperand slice(MLOperand input, sequence<[EnforceRange] unsigned long> starts, sequence<[EnforceRange] unsigned long> sizes, optional MLSliceOptions options = {});
@@ -224,4 +277,14 @@ partial interface MLGraphBuilder {
   [Throws] sequence<MLOperand> split(MLOperand input, ([EnforceRange] unsigned long or sequence<[EnforceRange] unsigned long>) splits, optional MLSplitOptions options = {});
   [Throws] MLOperand transpose(MLOperand input, optional MLTransposeOptions options = {});
   [Throws] MLOperand reduceSum(MLOperand input, optional MLReduceOptions options = {});
+  [Throws] MLOperand reduceMean(MLOperand input, optional MLReduceOptions options = {});
+  [Throws] MLOperand sqrt(MLOperand input, optional MLOperatorOptions options = {});
+  [Throws] MLOperand reciprocal(MLOperand input, optional MLOperatorOptions options = {});
+  [Throws] MLOperand gelu(MLOperand input, optional MLOperatorOptions options = {});
+  [Throws] MLOperand leakyRelu(MLOperand input, optional MLLeakyReluOptions options = {});
+  [Throws] MLOperand min(MLOperand a, MLOperand b, optional MLOperatorOptions options = {});
+  [Throws] MLOperand max(MLOperand a, MLOperand b, optional MLOperatorOptions options = {});
+  [Throws] MLOperand matmul(MLOperand a, MLOperand b, optional MLOperatorOptions options = {});
+  [Throws] MLOperand gemm(MLOperand a, MLOperand b, optional MLGemmOptions options = {});
+  [Throws] MLOperand convTranspose2d(MLOperand input, MLOperand filter, optional MLConvTranspose2dOptions options = {});
 };

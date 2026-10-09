@@ -34,6 +34,32 @@ pub(crate) enum PendingRead {
     },
 }
 
+/// Sends `destroy_tensor` when the `MLTensor` is garbage collected, so the
+/// backend device tensor is released even if the page never calls `destroy()`.
+/// Mirrors the WebGPU `DroppableGPUTexture`/`DroppableGPUBuffer` pattern.
+#[derive(JSTraceable, MallocSizeOf)]
+struct DroppableMLTensor {
+    #[no_trace]
+    #[ignore_malloc_size_of = "GenericSender"]
+    channel: webnn::WebNN,
+    #[no_trace]
+    context_id: webnn::ContextId,
+    tensor_id: u32,
+    /// Set once the tensor has been released (explicitly or via drop) so a
+    /// redundant `destroy_tensor` is not sent.
+    destroyed: Cell<bool>,
+}
+
+impl Drop for DroppableMLTensor {
+    fn drop(&mut self) {
+        if self.destroyed.get() {
+            return;
+        }
+        self.destroyed.set(true);
+        self.channel.destroy_tensor(self.context_id, self.tensor_id);
+    }
+}
+
 /// <https://www.w3.org/TR/webnn/#mltensor>
 #[dom_struct]
 pub(crate) struct MLTensor {
@@ -61,6 +87,8 @@ pub(crate) struct MLTensor {
     pending_reads: DomRefCell<Vec<PendingRead>>,
     /// Whether a backend read is already in flight for this tensor.
     read_in_flight: Cell<bool>,
+    /// Sends `destroy_tensor` on GC (see `DroppableMLTensor`).
+    droppable: DroppableMLTensor,
 }
 
 impl MLTensor {
@@ -86,6 +114,12 @@ impl MLTensor {
             pending_dispatches: Cell::new(0),
             pending_reads: DomRefCell::new(Vec::new()),
             read_in_flight: Cell::new(false),
+            droppable: DroppableMLTensor {
+                channel: context.channel().clone(),
+                context_id: context.context_id(),
+                tensor_id,
+                destroyed: Cell::new(false),
+            },
         }
     }
 
@@ -141,7 +175,9 @@ impl MLTensor {
 
     /// Appends a normal (non-BYOB) read request to the queue.
     pub(crate) fn append_read(&self, promise: Rc<Promise>) {
-        self.pending_reads.borrow_mut().push(PendingRead::Read(promise));
+        self.pending_reads
+            .borrow_mut()
+            .push(PendingRead::Read(promise));
     }
 
     /// Appends a BYOB read request along with its output buffer.
@@ -219,13 +255,19 @@ impl MLTensorMethods<crate::DomTypeHolder> for MLTensor {
     fn Destroy(&self) {
         // Step 1. Set this.[[isDestroyed]] to true.
         self.is_destroyed.set(true);
+        // Mark the GC droppable as destroyed so the Drop hook does not send a
+        // redundant destroy_tensor after the explicit destroy().
+        self.droppable.destroyed.set(true);
         // TODO Step 2. For each promise in this.[[pendingPromises]]:
         // TODO Step 2.1. Remove promise from this.[[pendingPromises]].
         // TODO Step 2.2. Reject promise with an "InvalidStateError" DOMException.
         // Step 3. Enqueue the following steps to this.[[context]].[[timeline]]:
         // Step 3.1. Release this.[[data]].
-        // Note: The tensor bytes are owned by the backend and released when the
-        // context is destroyed, so there is no DOM-side data to release here.
+        if let Some(context) = self.context.root() {
+            context
+                .channel()
+                .destroy_tensor(context.context_id(), self.tensor_id());
+        }
     }
 
     /// <https://www.w3.org/TR/webnn/#dom-mltensor-shape>

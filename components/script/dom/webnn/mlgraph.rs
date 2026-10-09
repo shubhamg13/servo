@@ -20,6 +20,38 @@ use crate::dom::promise::Promise;
 use crate::dom::webnn::mlcontext::MLContext;
 use crate::routed_promise::RoutedPromiseListener;
 
+/// Sends `destroy_graph` when the `MLGraph` is garbage collected, so the
+/// backend compiled graph is released even if the page never calls
+/// `graph.destroy()`. Mirrors the WebGPU `Droppable*` pattern.
+#[derive(JSTraceable, MallocSizeOf)]
+struct DroppableMLGraph {
+    #[no_trace]
+    #[ignore_malloc_size_of = "GenericSender"]
+    channel: webnn::WebNN,
+    #[no_trace]
+    context_id: webnn::ContextId,
+    /// Mirrors `MLGraph::graph_id`; 0 means the build never completed.
+    graph_id: Cell<usize>,
+    /// Set once the graph has been destroyed (explicitly or via drop) so a
+    /// redundant `destroy_graph` is not sent.
+    destroyed: Cell<bool>,
+}
+
+impl Drop for DroppableMLGraph {
+    fn drop(&mut self) {
+        if self.destroyed.get() {
+            return;
+        }
+        self.destroyed.set(true);
+        let graph_id = self.graph_id.get();
+        // graph_id 0 is the "not yet built" sentinel; the backend assigns ids
+        // starting at 1, so nothing to release.
+        if graph_id != 0 {
+            self.channel.destroy_graph(self.context_id, graph_id);
+        }
+    }
+}
+
 /// <https://www.w3.org/TR/webnn/#mlgraph>
 #[dom_struct]
 pub(crate) struct MLGraph {
@@ -31,6 +63,8 @@ pub(crate) struct MLGraph {
     is_destroyed: Cell<bool>,
     /// <https://www.w3.org/TR/webnn/#dom-mlgraph-outputdescriptors-slot>
     output_descriptors: DomRefCell<HashMap<String, (MLOperandDataType, Vec<u32>)>>,
+    /// Sends `destroy_graph` on GC (see `DroppableMLGraph`).
+    droppable: DroppableMLGraph,
 }
 
 impl MLGraph {
@@ -41,6 +75,12 @@ impl MLGraph {
             graph_id: Cell::new(0),
             is_destroyed: Cell::new(false),
             output_descriptors: DomRefCell::new(HashMap::new()),
+            droppable: DroppableMLGraph {
+                channel: context.channel().clone(),
+                context_id: context.context_id(),
+                graph_id: Cell::new(0),
+                destroyed: Cell::new(false),
+            },
         }
     }
 
@@ -68,6 +108,7 @@ impl MLGraph {
 
     pub(crate) fn set_graph_id(&self, graph_id: usize) {
         self.graph_id.set(graph_id);
+        self.droppable.graph_id.set(graph_id);
     }
 
     /// <https://www.w3.org/TR/webnn/#dom-mlgraph-outputdescriptors-slot>
@@ -96,6 +137,9 @@ impl MLGraphMethods<crate::DomTypeHolder> for MLGraph {
         }
         // Step 2. Set [[isDestroyed]] to true.
         self.is_destroyed.set(true);
+        // Mark the GC droppable as destroyed so the Drop hook does not send a
+        // redundant destroy_graph after the explicit destroy().
+        self.droppable.destroyed.set(true);
         // Step 3. Queue a task on this.[[context]].[[timeline]] to mark
         // resources owned by this graph as freeable.
         // Note: We call channel.destroy_graph directly instead of queueing on a

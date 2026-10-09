@@ -56,7 +56,7 @@ use js::glue::GetWindowProxyClass;
 use js::jsapi::{GCReason, JSContext as UnsafeJSContext};
 use js::jsval::UndefinedValue;
 use js::rust::ParentRuntime;
-use js::rust::wrappers2::{JS_AddInterruptCallback, JS_GC, SetWindowProxyClass};
+use js::rust::wrappers2::{JS_AddInterruptCallback, JS_GC, JS_MaybeGC, SetWindowProxyClass};
 use layout_api::{LayoutConfig, LayoutFactory, RestyleReason, ScriptThreadFactory};
 use media::WindowGLContext;
 use metrics::MAX_TASK_NS;
@@ -1528,6 +1528,15 @@ impl ScriptThread {
             window
                 .upcast::<GlobalScope>()
                 .perform_a_dom_garbage_collection_checkpoint();
+        }
+
+        // Nudge the JS GC once per event-loop batch so that unreachable DOM
+        // objects (and the backend resources their finalizers release, e.g.
+        // WebNN contexts/graphs/tensors) are collected promptly instead of
+        // waiting for an allocation-triggered GC. `JS_MaybeGC` runs only when
+        // the heap has grown since the last GC, so idle batches are cheap.
+        unsafe {
+            JS_MaybeGC(cx);
         }
 
         // TODO(43149): Remove when document replacement is implemented

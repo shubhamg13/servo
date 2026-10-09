@@ -18,8 +18,8 @@ use servo_base::generic_channel::GenericCallback;
 
 use crate::dom::bindings::buffer_source::get_buffer_source_copy;
 use crate::dom::bindings::codegen::Bindings::WebNNBinding::{
-    MLContextLostInfo, MLContextMethods, MLContextOptions, MLInputOperandLayout, MLOpSupportLimits,
-    MLOperandDataType, MLOperandDescriptor, MLPowerPreference, MLRankRange,
+    MLContextLostInfo, MLContextMethods, MLContextOptions, MLDeviceType, MLInputOperandLayout,
+    MLOpSupportLimits, MLOperandDataType, MLOperandDescriptor, MLPowerPreference, MLRankRange,
     MLSingleInputSupportLimits, MLTensorDescriptor, MLTensorLimits,
 };
 use crate::dom::bindings::codegen::UnionTypes::MaybeSharedArrayBufferViewOrMaybeSharedArrayBuffer;
@@ -143,6 +143,32 @@ pub(crate) fn validate_buffer_with_descriptor(
     true
 }
 
+/// Sends `destroy_context` when the `MLContext` is garbage collected, so the
+/// backend context (and all its graphs and tensors) is released even if the
+/// page never calls `context.destroy()`. Mirrors the WebGPU `Droppable*`
+/// pattern.
+#[derive(JSTraceable, MallocSizeOf)]
+struct DroppableMLContext {
+    #[no_trace]
+    #[ignore_malloc_size_of = "GenericSender"]
+    channel: webnn::WebNN,
+    #[no_trace]
+    context_id: webnn::ContextId,
+    /// Set once the context has been destroyed (explicitly or via drop) so a
+    /// redundant `destroy_context` is not sent.
+    destroyed: Cell<bool>,
+}
+
+impl Drop for DroppableMLContext {
+    fn drop(&mut self) {
+        if self.destroyed.get() {
+            return;
+        }
+        self.destroyed.set(true);
+        self.channel.destroy_context(self.context_id);
+    }
+}
+
 /// <https://www.w3.org/TR/webnn/#api-mlcontext>
 #[dom_struct]
 pub(crate) struct MLContext {
@@ -166,6 +192,8 @@ pub(crate) struct MLContext {
     /// context. Ids are unique within the context and key the backend tensor
     /// store.
     next_tensor_id: Cell<u32>,
+    /// Sends `destroy_context` on GC (see `DroppableMLContext`).
+    droppable: DroppableMLContext,
 }
 
 impl MLContext {
@@ -176,9 +204,15 @@ impl MLContext {
             MLPowerPreference::High_performance => webnn::BackendPowerPreference::HighPerformance,
             MLPowerPreference::Low_power => webnn::BackendPowerPreference::LowPower,
         };
+        let device_type = match options.deviceType {
+            MLDeviceType::Cpu => webnn::BackendDeviceType::Cpu,
+            MLDeviceType::Gpu => webnn::BackendDeviceType::Gpu,
+            MLDeviceType::Npu => webnn::BackendDeviceType::Npu,
+        };
         let backend_options = webnn::BackendOptions {
             power_preference,
             accelerated: options.accelerated,
+            device_type,
         };
         let channel = webnn::WebNN::shared().clone();
         channel.new_context(context_id, &backend_options);
@@ -188,9 +222,14 @@ impl MLContext {
             power_preference: options.powerPreference.clone(),
             is_lost: Cell::new(false),
             lost_promise: DomRefCell::new(None),
-            channel,
+            channel: channel.clone(),
             context_id,
             next_tensor_id: Cell::new(1),
+            droppable: DroppableMLContext {
+                channel,
+                context_id,
+                destroyed: Cell::new(false),
+            },
         }
     }
 
@@ -322,7 +361,13 @@ fn issue_tensor_read(
     tensor.set_read_in_flight(true);
     let trusted_tensor = Trusted::new(tensor);
     let tensor_id = tensor.tensor_id();
+    let t_read_send = std::time::Instant::now();
     let callback = GenericCallback::new(move |response: Result<webnn::ReadTensorResponse, _>| {
+        let t_read_cb = std::time::Instant::now();
+        log::error!(
+            "[webnn-timing] read->callback = {:.2}ms",
+            (t_read_cb - t_read_send).as_secs_f64() * 1e3
+        );
         let response = response.unwrap();
         let trusted_tensor = trusted_tensor.clone();
         task_source.queue(task!(webnn_read_tensor_result: move |cx| {
@@ -472,7 +517,13 @@ impl MLContextMethods<crate::DomTypeHolder> for MLContext {
         let task_source = self.global().task_manager().ml_task_source().to_sendable();
         let channel = self.channel.clone();
         let context_id = self.context_id;
+        let t_dispatch = std::time::Instant::now();
         let callback = GenericCallback::new(move |response: Result<webnn::RunResponse, _>| {
+            let t_cb = std::time::Instant::now();
+            log::error!(
+                "[webnn-timing] dispatch->callback = {:.2}ms",
+                (t_cb - t_dispatch).as_secs_f64() * 1e3
+            );
             let response = response.unwrap();
             let output_tensors = output_tensors.clone();
             let channel = channel.clone();
@@ -573,7 +624,8 @@ impl MLContextMethods<crate::DomTypeHolder> for MLContext {
         self.channel.create_tensor(
             self.context_id,
             tensor_id,
-            operand_descriptor_byte_length(&descriptor.parent),
+            descriptor.parent.dataType as u32,
+            &descriptor.parent.shape,
         );
         // Step 6.1.2. If that fails, then queue an ML task with global to
         // reject promise with an "UnknownError" DOMException, and abort
@@ -666,8 +718,13 @@ impl MLContextMethods<crate::DomTypeHolder> for MLContext {
         // promise with tensor.
         // TODO Step 10.2. If aborted, then queue an ML task with global to
         // reject promise with an "InvalidStateError" DOMException.
-        self.channel
-            .create_constant_tensor(self.context_id, tensor_id, source);
+        self.channel.create_constant_tensor(
+            self.context_id,
+            tensor_id,
+            descriptor.dataType as u32,
+            &descriptor.shape,
+            source,
+        );
         // Step 11. Return promise.
         let promise = Promise::new(cx, &self.global());
         promise.resolve_native(cx, &tensor);
@@ -894,6 +951,9 @@ impl MLContextMethods<crate::DomTypeHolder> for MLContext {
         // Step 2. Run the steps to lose this with an implementation-defined
         // message.
         self.is_lost.set(true);
+        // Mark the GC droppable as destroyed so the Drop hook does not send a
+        // redundant destroy_context after the explicit destroy().
+        self.droppable.destroyed.set(true);
         self.channel.destroy_context(self.context_id);
         let promise = self.Lost(cx);
         let info = MLContextLostInfo {

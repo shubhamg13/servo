@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::{Backend, BuilderId, GraphId, OperandId, Operator, RunResult};
+use crate::{Backend, BuilderId, GraphId, OperandId, Operator};
 
 #[allow(dead_code)]
 struct Node {
@@ -32,6 +32,7 @@ struct GraphState {
 pub struct MockBackend {
     builders: Mutex<HashMap<BuilderId, BuilderState>>,
     graphs: Mutex<HashMap<GraphId, GraphState>>,
+    tensors: Mutex<HashMap<u32, Vec<u8>>>,
     next_builder_id: AtomicUsize,
     next_graph_id: AtomicUsize,
 }
@@ -41,6 +42,7 @@ impl MockBackend {
         Self {
             builders: Mutex::new(HashMap::new()),
             graphs: Mutex::new(HashMap::new()),
+            tensors: Mutex::new(HashMap::new()),
             next_builder_id: AtomicUsize::new(1),
             next_graph_id: AtomicUsize::new(1),
         }
@@ -162,14 +164,48 @@ impl Backend for MockBackend {
     fn run(
         &self,
         _graph_id: GraphId,
-        inputs: &[(String, &[u8])],
-        output_labels: &[String],
-    ) -> Result<RunResult, String> {
-        let data = inputs.first().map(|(_, d)| d.to_vec()).unwrap_or_default();
-        let count = output_labels.len().max(1);
-        Ok(RunResult {
-            outputs: vec![data; count],
-        })
+        inputs: &[(String, u32)],
+        outputs: &[(String, u32)],
+    ) -> Result<(), String> {
+        // Mock behavior: echo the first input tensor into every output tensor.
+        let data = self
+            .tensors
+            .lock()
+            .unwrap()
+            .get(&inputs.first().map(|(_, id)| *id).unwrap_or(0))
+            .cloned()
+            .unwrap_or_default();
+        let mut tensors = self.tensors.lock().unwrap();
+        for (_, id) in outputs {
+            tensors.insert(*id, data.clone());
+        }
+        Ok(())
+    }
+
+    fn create_tensor(&self, tensor_id: u32, _data_type: u32, _shape: &[u32]) -> Result<(), String> {
+        self.tensors.lock().unwrap().insert(tensor_id, Vec::new());
+        Ok(())
+    }
+
+    fn write_tensor(&self, tensor_id: u32, bytes: &[u8]) -> Result<(), String> {
+        self.tensors
+            .lock()
+            .unwrap()
+            .insert(tensor_id, bytes.to_vec());
+        Ok(())
+    }
+
+    fn read_tensor(&self, tensor_id: u32) -> Result<Vec<u8>, String> {
+        self.tensors
+            .lock()
+            .unwrap()
+            .get(&tensor_id)
+            .cloned()
+            .ok_or_else(|| format!("unknown tensor {tensor_id}"))
+    }
+
+    fn destroy_tensor(&self, tensor_id: u32) {
+        self.tensors.lock().unwrap().remove(&tensor_id);
     }
 
     fn destroy_graph(&self, graph_id: GraphId) {
