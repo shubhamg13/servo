@@ -113,7 +113,11 @@ impl taffy::LayoutPartialTree for TaffyContainerContext<'_> {
         Self: 'a;
 
     fn get_core_container_style(&self, _node_id: taffy::NodeId) -> Self::CoreContainerStyle<'_> {
-        TaffyStyloStyle::new(self.style, false /* is_replaced */)
+        TaffyStyloStyle::new(
+            self.style,
+            false, /* is_replaced */
+            self.style.writing_mode.is_bidi_ltr(),
+        )
     }
 
     fn set_unrounded_layout(&mut self, node_id: taffy::NodeId, layout: &taffy::Layout) {
@@ -279,7 +283,11 @@ impl taffy::LayoutGridContainer for TaffyContainerContext<'_> {
         &self,
         _node_id: taffy::prelude::NodeId,
     ) -> Self::GridContainerStyle<'_> {
-        TaffyStyloStyle::new(self.style, false /* is_replaced */)
+        TaffyStyloStyle::new(
+            self.style,
+            false, /* is_replaced */
+            self.style.writing_mode.is_bidi_ltr(),
+        )
     }
 
     fn get_grid_child_style(
@@ -291,7 +299,11 @@ impl taffy::LayoutGridContainer for TaffyContainerContext<'_> {
         // TODO: account for non-replaced elements that are "compressible replaced"
         let is_replaced = child.is_in_flow_replaced();
         let stylo_style = AtomicRef::map(child, |c| &*c.style);
-        TaffyStyloStyle::new(stylo_style, is_replaced)
+        TaffyStyloStyle::new(
+            stylo_style,
+            is_replaced,
+            self.style.writing_mode.is_bidi_ltr(),
+        )
     }
 
     fn set_detailed_grid_info(
@@ -567,6 +579,18 @@ impl TaffyContainer {
                         let hoisted_box = AbsolutelyPositionedBox::to_hoisted(
                             abs_pos_box.clone(),
                             content_size,
+                            #[cfg(feature = "ht_ai_gen")]
+                            LogicalVec2 {
+                                inline: resolve_alignment(
+                                    child.style.clone_justify_self().0,
+                                    justify_items.computed.0.0,
+                                ),
+                                block: resolve_alignment(
+                                    child.style.clone_align_self().0,
+                                    align_items.0,
+                                ),
+                            },
+                            #[cfg(not(feature = "ht_ai_gen"))]
                             LogicalVec2 {
                                 inline: resolve_alignment(
                                     child.style.clone_align_self().0,

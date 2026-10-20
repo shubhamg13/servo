@@ -205,6 +205,12 @@ pub fn content_alignment(input: stylo::ContentDistribution) -> Option<taffy::Ali
         stylo::AlignFlags::FLEX_START => taffy::AlignContentKeyword::FlexStart,
         stylo::AlignFlags::STRETCH => taffy::AlignContentKeyword::Stretch,
         stylo::AlignFlags::FLEX_END => taffy::AlignContentKeyword::FlexEnd,
+        // `flow-start`/`flow-end` are flow-relative aliases for the legacy
+        // `flex-start`/`flex-end` values.
+        #[cfg(feature = "ht_ai_gen")]
+        stylo::AlignFlags::FLOW_START => taffy::AlignContentKeyword::FlexStart,
+        #[cfg(feature = "ht_ai_gen")]
+        stylo::AlignFlags::FLOW_END => taffy::AlignContentKeyword::FlexEnd,
         stylo::AlignFlags::CENTER => taffy::AlignContentKeyword::Center,
         stylo::AlignFlags::SPACE_BETWEEN => taffy::AlignContentKeyword::SpaceBetween,
         stylo::AlignFlags::SPACE_AROUND => taffy::AlignContentKeyword::SpaceAround,
@@ -233,6 +239,12 @@ pub fn item_alignment(input: stylo::AlignFlags) -> Option<taffy::AlignItems> {
         stylo::AlignFlags::SELF_END => taffy::AlignItemsKeyword::End,
         stylo::AlignFlags::START => taffy::AlignItemsKeyword::Start,
         stylo::AlignFlags::END => taffy::AlignItemsKeyword::End,
+        // `flow-start`/`flow-end` are flow-relative aliases that behave like the
+        // legacy `flex-start`/`flex-end`.
+        #[cfg(feature = "ht_ai_gen")]
+        stylo::AlignFlags::FLOW_START => taffy::AlignItemsKeyword::FlexStart,
+        #[cfg(feature = "ht_ai_gen")]
+        stylo::AlignFlags::FLOW_END => taffy::AlignItemsKeyword::FlexEnd,
         stylo::AlignFlags::LEFT => taffy::AlignItemsKeyword::Start,
         stylo::AlignFlags::RIGHT => taffy::AlignItemsKeyword::End,
         stylo::AlignFlags::CENTER => taffy::AlignItemsKeyword::Center,

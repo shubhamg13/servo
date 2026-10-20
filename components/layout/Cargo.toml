@@ -16,6 +16,9 @@ test = true
 doctest = false
 
 [features]
+# Experiment-scoped gate for agentic layout features. Servo behavior gated behind
+# this feature is active only when it is enabled; without it servo behaves stock.
+ht_ai_gen = []
 tracing = ["dep:tracing"]
 
 [dependencies]

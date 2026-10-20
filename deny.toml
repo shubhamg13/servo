@@ -217,3 +217,9 @@ skip = [
     "phf_macros",
     "phf_shared",
 ]
+
+# github.com organizations to allow git sources for
+[sources.allow-org]
+github = [
+    "shubhamg13",
+]

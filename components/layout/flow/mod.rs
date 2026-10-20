@@ -984,6 +984,19 @@ impl BlockLevelBox {
                 // The static position of zero here is incorrect, however we do not know
                 // the correct positioning until later, in place_block_level_fragment, and
                 // this value will be adjusted there.
+                #[cfg(feature = "ht_ai_gen")]
+                let inline_alignment = {
+                    let justify_self = box_.borrow().context.style().clone_justify_self().0;
+                    if justify_self == AlignFlags::AUTO {
+                        // `justify-self: auto` behaves like the computed `justify-items`
+                        // of the containing block for statically positioned boxes.
+                        // <https://drafts.csswg.org/css-align/#justify-self-auto>
+                        // <https://github.com/w3c/csswg-drafts/issues/12121>
+                        containing_block.style.clone_justify_items().computed.0.0
+                    } else {
+                        justify_self
+                    }
+                };
                 let hoisted_box = AbsolutelyPositionedBox::to_hoisted(
                     box_.clone(),
                     // This is incorrect, however we do not know the correct positioning
@@ -991,6 +1004,9 @@ impl BlockLevelBox {
                     // adjusted there
                     PhysicalRect::zero(),
                     LogicalVec2 {
+                        #[cfg(feature = "ht_ai_gen")]
+                        inline: inline_alignment,
+                        #[cfg(not(feature = "ht_ai_gen"))]
                         inline: AlignFlags::START,
                         block: AlignFlags::START,
                     },
@@ -1770,6 +1786,10 @@ fn justify_self_alignment(
         AlignFlags::NORMAL => {},
         AlignFlags::CENTER => return free_space / 2,
         AlignFlags::END => return free_space,
+        // `flow-end` is equivalent to `end` here; `flow-start` falls through to
+        // the catch-all below, just like `start`.
+        #[cfg(feature = "ht_ai_gen")]
+        AlignFlags::FLOW_END => return free_space,
         _ => return Au::zero(),
     }
 
@@ -2068,7 +2088,18 @@ impl<'container> PlacementState<'container> {
                             self.current_block_direction_position),
                         inline: Au::zero(),
                     },
-                    size: LogicalVec2::zero(),
+                    size: LogicalVec2 {
+                        // When the abspos has a `justify-self` other than `start`, the
+                        // static position rectangle is the alignment container, so it
+                        // needs the inline size of the box that establishes the static
+                        // position.
+                        // <https://drafts.csswg.org/css-position-3/#staticpos-rect>
+                        #[cfg(feature = "ht_ai_gen")]
+                        inline: self.containing_block.size.inline,
+                        #[cfg(not(feature = "ht_ai_gen"))]
+                        inline: Au::zero(),
+                        block: Au::zero(),
+                    },
                 }
                 .as_physical(Some(self.containing_block));
             },

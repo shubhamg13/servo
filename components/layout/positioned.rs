@@ -638,7 +638,7 @@ impl IndependentFormattingContext {
         let inline_box_offsets = box_offset.inline_sides().percentages_relative_to(cbis);
         let inline_alignment = match inline_box_offsets.either_specified() {
             true => style.clone_justify_self().0,
-            false => resolved_alignment.inline,
+            false => static_position_inline_alignment(&style, resolved_alignment.inline),
         };
 
         let inline_axis_solver = AbsoluteAxisSolver {
@@ -719,7 +719,6 @@ impl IndependentFormattingContext {
             get_inline_content_size,
             is_table,
         );
-
         let containing_block_for_children = ContainingBlock {
             size: ContainingBlockSize {
                 inline: inline_size,
@@ -852,6 +851,29 @@ impl LogicalRect<Au> {
                 length: self.size.inline,
             },
         }
+    }
+}
+
+/// Resolves the inline-axis alignment to use when the static-position rect is the
+/// alignment container, i.e. when both inline insets are `auto`.
+/// <https://drafts.csswg.org/css-position-3/#abspos-alignment>
+#[cfg(not(feature = "ht_ai_gen"))]
+fn static_position_inline_alignment(_style: &ComputedValues, resolved: AlignFlags) -> AlignFlags {
+    resolved
+}
+
+/// <https://drafts.csswg.org/css-align/#justify-abspos>
+#[cfg(feature = "ht_ai_gen")]
+fn static_position_inline_alignment(style: &ComputedValues, resolved: AlignFlags) -> AlignFlags {
+    let justify_self = style.clone_justify_self().0;
+    // `auto` keeps the alignment resolved by the layout mode that produced the
+    // static position (`justify-items` for block containers, the resolved
+    // alignment for flex and grid); any other value aligns the box within the
+    // static-position rect.
+    if justify_self == AlignFlags::AUTO {
+        resolved
+    } else {
+        justify_self
     }
 }
 
@@ -1032,6 +1054,12 @@ impl AbsoluteAxisSolver {
             // https://drafts.csswg.org/css-align/#valdef-self-position-flex-end
             // https://drafts.csswg.org/css-align/#valdef-justify-self-last-baseline
             AlignFlags::END | AlignFlags::FLEX_END | AlignFlags::LAST_BASELINE => AlignFlags::END,
+            #[cfg(feature = "ht_ai_gen")]
+            AlignFlags::FLOW_END => AlignFlags::END,
+            #[cfg(feature = "ht_ai_gen")]
+            // https://drafts.csswg.org/css-anchor-1/#anchor-center
+            // Without a default anchor, `anchor-center` falls back to centering.
+            AlignFlags::ANCHOR_CENTER => AlignFlags::CENTER,
             // https://drafts.csswg.org/css-align/#valdef-self-position-start
             // https://drafts.csswg.org/css-align/#valdef-self-position-flex-start
             // https://drafts.csswg.org/css-align/#valdef-justify-self-first-baseline

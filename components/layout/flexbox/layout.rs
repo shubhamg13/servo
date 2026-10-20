@@ -327,12 +327,35 @@ struct FinalFlexLineLayout {
     all_baselines: Baselines,
 }
 
+/// In flex layout the legacy `flex-start`/`flex-end` keywords and their canonical computed
+/// forms `flow-start`/`flow-end` are equivalent: both refer to the flex container's
+/// main-start/cross-start side (accounting for `*-reverse`). Normalize the canonical form
+/// back to the legacy one, which is what the rest of this module operates on.
+///
+/// <https://drafts.csswg.org/css-align/#valdef-self-position-flow-start>
+#[cfg(feature = "ht_ai_gen")]
+fn flow_alignment_as_legacy_flex_alignment(align_flags: AlignFlags) -> AlignFlags {
+    match align_flags.value() {
+        AlignFlags::FLOW_START => AlignFlags::FLEX_START | align_flags.flags(),
+        AlignFlags::FLOW_END => AlignFlags::FLEX_END | align_flags.flags(),
+        _ => align_flags,
+    }
+}
+
+/// Stock behaviour with the `ht_ai_gen` feature disabled: `flow-start`/`flow-end` are
+/// already handled exactly like their legacy spellings.
+#[cfg(not(feature = "ht_ai_gen"))]
+fn flow_alignment_as_legacy_flex_alignment(align_flags: AlignFlags) -> AlignFlags {
+    align_flags
+}
+
 impl FlexContainerConfig {
     fn resolve_reversable_flex_alignment(
         &self,
         align_flags: AlignFlags,
         reversed: bool,
     ) -> AlignFlags {
+        let align_flags = flow_alignment_as_legacy_flex_alignment(align_flags);
         match (align_flags.value(), reversed) {
             (AlignFlags::FLEX_START, false) => AlignFlags::START | align_flags.flags(),
             (AlignFlags::FLEX_START, true) => AlignFlags::END | align_flags.flags(),
@@ -756,10 +779,11 @@ impl FlexContainer {
 
             // From https://drafts.csswg.org/css-align/#distribution-flex
             // > `normal` behaves as `stretch`.
-            let mut resolved_align_content = match align_content_style.value() {
-                AlignFlags::NORMAL => AlignFlags::STRETCH,
-                align_content => align_content,
-            };
+            let mut resolved_align_content =
+                flow_alignment_as_legacy_flex_alignment(match align_content_style.value() {
+                    AlignFlags::NORMAL => AlignFlags::STRETCH,
+                    align_content => align_content,
+                });
 
             // From https://drafts.csswg.org/css-flexbox/#algo-line-align:
             // > Some alignments can only be fulfilled in certain situations or are
@@ -1651,7 +1675,8 @@ impl InitialFlexLineLayout<'_> {
             let justify_content_style = flex_context.config.justify_content.primary();
 
             // Inital values from the style system
-            let mut resolved_justify_content = justify_content_style.value();
+            let mut resolved_justify_content =
+                flow_alignment_as_legacy_flex_alignment(justify_content_style.value());
             let mut is_safe = justify_content_style.flags() == AlignFlags::SAFE;
 
             // Fallback occurs in two cases:

@@ -208,8 +208,8 @@ impl SpecificTaffyGridInfo {
         containing_block: &DefiniteContainingBlock,
         containing_block_border: PhysicalSides<Au>,
     ) -> PhysicalRect<Au> {
-        let item_style = TaffyStyloStyle::new(item_style, false);
         let writing_mode = containing_block.style.writing_mode;
+        let item_style = TaffyStyloStyle::new(item_style, false, writing_mode.is_bidi_ltr());
         let physical_containing_block_size = containing_block.size.to_physical_size(writing_mode);
 
         // Convert direction to Taffy type
