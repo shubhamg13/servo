@@ -468,6 +468,17 @@ pub struct StackingContext {
     /// Whether or not this [`StackingContext`] participates in a 3D rendering context.
     /// See <https://www.w3.org/TR/css-transforms-2/#3d-rendering-contexts>
     pub(crate) participates_in_a_3d_rendering_context: bool,
+
+    /// Whether or not this [`StackingContext`] or any of its descendants has a
+    /// backdrop filter.
+    ///
+    /// A backdrop root only needs its own surface when some descendant actually has a
+    /// backdrop filter that samples the Backdrop Root Image. The backdrop-filter rendering
+    /// algorithm is defined as content being “rendered as if” the image is copied and
+    /// filtered (<https://drafts.fxtf.org/filter-effects-2/#backdrop-filter-operation>), so
+    /// skipping the surface when nothing samples it is not observable. Gecko tracks the
+    /// same information with its `ContainsBackdropFilter` stacking-context bit.
+    pub(crate) contains_backdrop_filter: bool,
 }
 
 impl StackingContext {
@@ -484,6 +495,7 @@ impl StackingContext {
             container_timing_roots: None,
             reference_frame_info: None,
             participates_in_a_3d_rendering_context: false,
+            contains_backdrop_filter: false,
         }
     }
 
@@ -501,6 +513,12 @@ impl StackingContext {
         let z_index = initializing_fragment
             .style()
             .effective_z_index(initializing_fragment.base.flags);
+        let contains_backdrop_filter = !initializing_fragment
+            .style()
+            .get_effects()
+            .backdrop_filter
+            .0
+            .is_empty();
         Self {
             fragment: StackingContextFragments::Fragment(initializing_fragment),
             context_type,
@@ -514,6 +532,7 @@ impl StackingContext {
             reference_frame_info,
             participates_in_a_3d_rendering_context: parent_info
                 .participates_in_a_3d_rendering_context,
+            contains_backdrop_filter,
         }
     }
 
@@ -850,6 +869,16 @@ impl BoxFragment {
         } else {
             child_stacking_context.sort();
         }
+
+        // Propagate whether this subtree contains a backdrop filter, so that ancestors that
+        // form a backdrop root only create an isolation surface when a descendant will use it.
+        child_stacking_context.contains_backdrop_filter |= child_stacking_context
+            .children
+            .iter()
+            .chain(stolen_children.iter())
+            .any(|child| child.contains_backdrop_filter);
+        parent_stacking_context.contains_backdrop_filter |=
+            child_stacking_context.contains_backdrop_filter;
 
         parent_stacking_context
             .children

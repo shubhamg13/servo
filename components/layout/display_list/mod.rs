@@ -469,6 +469,15 @@ impl DisplayListBuilder<'_> {
         };
         let spatial_id = self.spatial_id(stacking_context.scroll_tree_node_id);
 
+        // From <https://drafts.fxtf.org/filter-effects-2/#BackdropRoot>:
+        // > Note: this definition encompases fewer element types than the definition for a
+        // > Stacking Context. In particular, a Backdrop Root is not formed by elements with
+        // > z-index applied, fixed or sticky-positioned elements, and elements with
+        // > transforms applied.
+        // This stacking context only groups the transformed element, so it must never be
+        // selected as the backdrop root for a backdrop filter in its subtree.
+        let stacking_context_flags = StackingContextFlags::WRAPS_BACKDROP_FILTER;
+
         self.wr().push_stacking_context(
             spatial_id,
             style.webrender_primitive_flags(),
@@ -478,7 +487,7 @@ impl DisplayListBuilder<'_> {
             &[], // filters
             &[], // filter_datas
             wr::RasterSpace::Screen,
-            StackingContextFlags::empty(),
+            stacking_context_flags,
             None, // snapshot
         );
         true
@@ -502,10 +511,22 @@ impl DisplayListBuilder<'_> {
         let mix_blend_mode;
         let mut filters: Vec<_>;
         let mut stacking_context_flags = StackingContextFlags::empty();
+        let mut has_backdrop_filter = false;
+        let mut needs_backdrop_root_surface = false;
         match &stacking_context.fragment {
             StackingContextFragments::Fragment(fragment) => {
                 let style = fragment.style();
                 let effects = style.get_effects();
+
+                // The root element's own backdrop filter is ignored, so it never needs to be
+                // treated as a wrapper around a backdrop filter.
+                has_backdrop_filter = style.has_backdrop_filter(fragment.base.flags);
+                // Only create an isolation surface when this subtree actually contains a
+                // backdrop filter that would sample from it.
+                let establishes_backdrop_root =
+                    style.establishes_backdrop_root(fragment.base.flags);
+                needs_backdrop_root_surface =
+                    establishes_backdrop_root && stacking_context.contains_backdrop_filter;
 
                 mix_blend_mode = effects.mix_blend_mode.to_webrender();
                 primitive_flags = style.webrender_primitive_flags();
@@ -521,8 +542,9 @@ impl DisplayListBuilder<'_> {
                 // WebRender only uses the stacking context to apply certain effects. If we don't
                 // actually need to create a stacking context, just avoid creating one.
                 if !is_blend_container &&
+                    !needs_backdrop_root_surface &&
+                    !has_backdrop_filter &&
                     effects.filter.0.is_empty() &&
-                    effects.backdrop_filter.0.is_empty() &&
                     effects.opacity == 1.0 &&
                     effects.mix_blend_mode == ComputedMixBlendMode::Normal &&
                     style.get_svg().clip_path == ComputedClipPath::None
@@ -557,6 +579,29 @@ impl DisplayListBuilder<'_> {
 
         if is_blend_container {
             stacking_context_flags.insert(StackingContextFlags::IS_BLEND_CONTAINER);
+        }
+
+        if has_backdrop_filter {
+            // From <https://drafts.fxtf.org/filter-effects-2/#BackdropRoot>:
+            // > * An element with a backdrop-filter value other than "none".
+            // WebRender attaches the backdrop filter chain to the nearest stacking context that
+            // is not flagged as wrapping a backdrop filter. This stacking context applies the
+            // element's own effects (opacity, filter, blend mode, transform, clip) to the filter
+            // result, so it must be skipped. The isolated backdrop root that descendants sample
+            // from is pushed separately in `build_backdrop_filter`.
+            stacking_context_flags.insert(StackingContextFlags::WRAPS_BACKDROP_FILTER);
+        } else if needs_backdrop_root_surface {
+            // This element is a backdrop root and its subtree contains a backdrop filter, so it
+            // needs its own surface for the Backdrop Root Image:
+            // > The Backdrop Root Image for an element E is the final image that would be
+            // > produced by the following steps:
+            // > 1. Start at the Backdrop Root element that is the nearest ancestor of E.
+            // > 2. Paint all content, in painting order, between (and including) the ancestor
+            // > Backdrop Root element and element E.
+            // > 3. Flatten the painted content into a 2D screen-space buffer.
+            // > 4. Transform the border box of element E to 2D screen-space, and clip the final
+            // > painted output to this border quad.
+            stacking_context_flags.insert(StackingContextFlags::FORCED_ISOLATION);
         }
 
         // WebRender has two different ways of expressing "no clip." ClipChainId::INVALID
@@ -815,6 +860,24 @@ impl DisplayListBuilder<'_> {
         // `ClipId::INVALID` during stacking context tree construction.
         let clip_chain_id = Some(self.clip_chain_id(reference_frame_info.captured_clip_id));
         let spatial_id = self.spatial_id(reference_frame_info.parent_spatial_node_id);
+
+        // From <https://drafts.fxtf.org/filter-effects-2/#BackdropRoot>:
+        // > A Backdrop Root is formed, anywhere in the document, by an element in any of the
+        // > following scenarios. See [[#BackdropRootTriggers]] for more details on each:
+        // >  * The root element of the document (HTML).
+        // >  * An element with a filter property other than "none".
+        // >  * An element with an opacity value less than 1.
+        // >  * An element with mask, mask-image, mask-border, or clip-path properties with values
+        // > other than “none”.
+        // >  * An element with a backdrop-filter value other than "none".
+        // >  * An element with a mix-blend-mode value other than "normal".
+        // >  * An element with a will-change value specifying any property that would create a
+        // > Backdrop Root on non-initial value.
+        // This synthetic clip stacking context creates a parent surface, but it is none of the
+        // scenarios above, so it must never be selected as the backdrop root for a backdrop
+        // filter in its subtree.
+        let stacking_context_flags = wr::StackingContextFlags::WRAPS_BACKDROP_FILTER;
+
         self.wr().push_stacking_context(
             spatial_id,
             PrimitiveFlags::default(),
@@ -824,7 +887,7 @@ impl DisplayListBuilder<'_> {
             &[], // filters,
             &[], // filter_datas
             wr::RasterSpace::Screen,
-            wr::StackingContextFlags::empty(),
+            stacking_context_flags,
             None, // snapshot
         );
 
@@ -833,16 +896,24 @@ impl DisplayListBuilder<'_> {
 }
 
 impl PaintTraversalHandler for DisplayListBuilder<'_> {
-    /// A tuple composed of the number of real WebRender stacking contexts pushed
-    /// and the previous `Self::current_reference_frame_scroll_node_id` value of
-    /// the `DisplayListBuilder` when a stacking context was visited (or `None` if
-    /// the value was unmodified).
-    type StackingContextState = (usize, Option<ScrollTreeNodeId>);
+    /// A tuple composed of the number of real WebRender stacking contexts pushed, the previous
+    /// `Self::current_reference_frame_scroll_node_id` value of the `DisplayListBuilder` when a
+    /// stacking context was visited (or `None` if the value was unmodified), and whether
+    /// painting this stacking context pushes a backdrop-root isolation stacking context.
+    type StackingContextState = (usize, Option<ScrollTreeNodeId>, bool);
 
     fn visit_stacking_context(
         &mut self,
         stacking_context: &StackingContext,
     ) -> Self::StackingContextState {
+        // `build_backdrop_filter` pushes an isolation stacking context around the contents of
+        // an element with a painted backdrop filter, which `leave_stacking_context` must pop.
+        let pushes_backdrop_root_stacking_context =
+            stacking_context.fragment().is_some_and(|fragment| {
+                !fragment.base.flags.contains(FragmentFlags::DO_NOT_PAINT) &&
+                    fragment.style().has_backdrop_filter(fragment.base.flags)
+            });
+
         let (mut stacking_contexts_pushed, old_reference_frame) =
             self.visit_stacking_context_reference_frame_info(stacking_context);
         if self.push_webrender_stacking_context_for_transform_if_necessary(stacking_context) {
@@ -851,7 +922,11 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
         if self.push_webrender_stacking_context_if_necessary(stacking_context) {
             stacking_contexts_pushed += 1;
         }
-        (stacking_contexts_pushed, old_reference_frame)
+        (
+            stacking_contexts_pushed,
+            old_reference_frame,
+            pushes_backdrop_root_stacking_context,
+        )
     }
 
     fn leave_stacking_context(
@@ -859,7 +934,16 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
         _: &TraversalState,
         stacking_context_state: Self::StackingContextState,
     ) {
-        let (stacking_contexts_pushed, old_reference_frame) = stacking_context_state;
+        let (stacking_contexts_pushed, old_reference_frame, pushes_backdrop_root_stacking_context) =
+            stacking_context_state;
+
+        // The backdrop-root isolation stacking context is pushed while painting the contents of
+        // a backdrop-filter element, above the stacking contexts pushed by
+        // `visit_stacking_context`, so pop it first.
+        if pushes_backdrop_root_stacking_context {
+            self.wr().pop_stacking_context();
+        }
+
         for _ in 0..stacking_contexts_pushed {
             self.wr().pop_stacking_context();
         }
@@ -1848,24 +1932,39 @@ impl<'a> BuilderForBoxFragment<'a> {
     }
 
     fn build_backdrop_filter(&mut self, builder: &mut DisplayListBuilder, state: &TraversalState) {
-        // https://drafts.fxtf.org/filter-effects-2/#BackdropFilterProperty
-        // > ... unless the element it applies to is a document root element in
-        // > the current browsing context.
-        if self
-            .fragment
-            .base
-            .flags
-            .contains(FragmentFlags::IS_ROOT_ELEMENT)
-        {
-            return;
-        }
-
+        // From <https://drafts.fxtf.org/filter-effects-2/#backdrop-filter-operation>:
+        // > An element (call it B) with a backdrop-filter property other than
+        // > backdrop-filter/none is rendered as if the following steps are performed:
+        // > 1. Copy the Backdrop Root Image into a temporary buffer, such as a raster image.
+        // >    Call this buffer T’.
+        // > 2. Apply the backdrop-filter’s filter operations to the entire contents of T'.
+        // > 3. If element B has any transforms (between B and the Backdrop Root), apply the
+        // >    inverse of those transforms to the contents of T’.
+        // > 4. Apply a clip to the contents of T’, using the border box of element B, including
+        // >    border-radius if specified. Note that the children of B are not considered for
+        // >    the sizing or location of this clip.
+        // > 5. Draw all of element B, including its background, border, and any children
+        // >    elements, into T’.
+        // > 6. If element B has any transforms, effects, or clips, apply those to T’.
+        // > 7. Composite the contents of T’ into element B's parent, using source-over
+        // >    compositing.
+        //
+        // From <https://drafts.fxtf.org/filter-effects-2/#BackdropFilterProperty>:
+        // > A computed value of other than backdrop-filter/none results in the creation of both
+        // > a stacking context [[!CSS21]] and a Containing Block for absolute and fixed position
+        // > descendants, unless the element it applies to is a document root element in the
+        // > current browsing context.
+        // The stacking context and containing block are handled in `style_ext.rs`.
         let style = self.fragment.style();
-        let effects = style.get_effects();
-        if effects.backdrop_filter.0.is_empty() {
+        if !style.has_backdrop_filter(self.fragment.base.flags) {
             return;
         }
+        let effects = style.get_effects();
 
+        // > If the filter functions list includes a blur() filter, the filter will be applied
+        // > with edgeMode="mirror", with the edge defined by the clipped, transformed border
+        // > box of the element. See [[#BackdropRoot]].
+        // WebRender applies backdrop-filter blurs with mirror edge mode.
         let current_color = style.get_color();
         let filters: Vec<_> = effects
             .backdrop_filter
@@ -1879,6 +1978,47 @@ impl<'a> BuilderForBoxFragment<'a> {
             common.clip_chain_id = clip_chain_id;
         }
         builder.wr().push_backdrop_filter(&common, &filters, &[]);
+
+        // > The Backdrop Root Image for an element E is the final image that would be produced
+        // > by the following steps:
+        // > 1. Start at the Backdrop Root element that is the nearest ancestor of E.
+        // > 2. Paint all content, in painting order, between (and including) the ancestor
+        // > Backdrop Root element and element E.
+        // > 3. Flatten the painted content into a 2D screen-space buffer.
+        // > 4. Transform the border box of element E to 2D screen-space, and clip the final
+        // > painted output to this border quad.
+        //
+        // > Note: No content that is a DOM ancestor of the Backdrop Root element should
+        // > contribute to or affect the Backdrop Root Image.
+        //
+        // TODO: The default canvas background (the shell background) is not painted into the
+        // display list, so it cannot contribute to the Backdrop Root Image when the nearest
+        // backdrop root is the root element.
+        //
+        // A backdrop-filter element is a backdrop root for its descendants, but the element's
+        // own filter must sample the Backdrop Root Image of its nearest ancestor root. Push an
+        // isolated stacking context after the backdrop filter item so that it wraps the
+        // element's background, border and contents: descendants' backdrop filters sample from
+        // this surface, while the item above samples the backdrop outside of it.
+        // https://drafts.fxtf.org/filter-effects-2/#BackdropRoot
+        let clip_chain_id = match state.clip_id {
+            ClipId::INVALID => None,
+            clip_id => Some(builder.clip_chain_id(clip_id)),
+        };
+        let spatial_id = builder.spatial_id(state.spatial_id);
+        let primitive_flags = style.webrender_primitive_flags();
+        builder.wr().push_stacking_context(
+            spatial_id,
+            primitive_flags,
+            clip_chain_id,
+            TransformStyle::Flat,
+            MixBlendMode::Normal,
+            &[], // filters
+            &[], // filter_datas
+            wr::RasterSpace::Screen,
+            StackingContextFlags::FORCED_ISOLATION,
+            None, // snapshot
+        );
     }
 
     fn build_background(&mut self, builder: &mut DisplayListBuilder, state: &TraversalState) {
