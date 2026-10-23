@@ -711,6 +711,16 @@ impl DisplayListBuilder<'_> {
         }
     }
 
+    /// Display list coordinates are relative to the border box of the nearest
+    /// ancestor reference frame, while the scroll tree's transforms map document
+    /// coordinates to the root. Return the offset between the two spaces.
+    fn reference_frame_offset(&self, state: &TraversalState) -> LayoutVector2D {
+        self.paint_info
+            .scroll_tree
+            .reference_frame_offset(state.spatial_id)
+            .to_vector()
+    }
+
     #[expect(clippy::too_many_arguments)]
     fn collect_image_record(
         &mut self,
@@ -727,6 +737,7 @@ impl DisplayListBuilder<'_> {
             return;
         }
 
+        let reference_frame_offset = self.reference_frame_offset(state);
         let transform = self
             .paint_info
             .scroll_tree
@@ -734,8 +745,8 @@ impl DisplayListBuilder<'_> {
 
         self.paint_timing_handler.append_image_record(
             tag,
-            bounds,
-            clip_rect,
+            bounds.translate(reference_frame_offset),
+            clip_rect.translate(reference_frame_offset),
             transform,
             url,
             natural_width,
@@ -769,6 +780,7 @@ impl DisplayListBuilder<'_> {
             return;
         };
 
+        let reference_frame_offset = self.reference_frame_offset(state);
         let transform = self
             .paint_info
             .scroll_tree
@@ -777,8 +789,8 @@ impl DisplayListBuilder<'_> {
         self.paint_timing_handler.update_container_timing(
             container_timing_roots,
             tag.node,
-            bounds,
-            clip_rect,
+            bounds.translate(reference_frame_offset),
+            clip_rect.translate(reference_frame_offset),
             transform,
             natural_width,
             natural_height,
@@ -1325,13 +1337,14 @@ impl Fragment {
                 if let Some(tag) = state.containing_element_tag &&
                     builder.largest_contentful_paint_enabled
                 {
+                    let reference_frame_offset = builder.reference_frame_offset(state);
                     let transform = builder
                         .paint_info
                         .scroll_tree
                         .cumulative_node_to_root_transform(state.spatial_id);
                     builder.paint_timing_handler.accumulate_text_rect(
                         tag,
-                        rect.to_webrender(),
+                        rect.to_webrender().translate(reference_frame_offset),
                         transform,
                         &parent_style,
                     );
