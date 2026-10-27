@@ -127,6 +127,9 @@ pub trait LayoutElement<'dom>: Copy + Debug + Send + Sync {
     /// and `false` otherwise.
     fn is_html_element_in_html_document(&self) -> bool;
 
+    /// Returns `true` if this [`LayoutElement`] is in the MathML namespace and `false` otherwise.
+    fn is_mathml_element(&self) -> bool;
+
     /// Returns whether this node is the root element in an HTML document element.
     ///
     /// Note that, like `Self::is_body_element_of_html_element_root`, this accesses the parent.

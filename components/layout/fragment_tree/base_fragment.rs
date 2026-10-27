@@ -167,6 +167,13 @@ impl From<ServoLayoutNode<'_>> for BaseFragmentInfo {
         let pseudo_element_chain = node.pseudo_element_chain();
         let mut flags = FragmentFlags::empty();
 
+        if node
+            .as_element()
+            .is_some_and(|element| element.is_mathml_element())
+        {
+            flags.insert(FragmentFlags::IS_MATHML_ELEMENT);
+        }
+
         if let Some(innermost_pseudo) = pseudo_element_chain.innermost() {
             match innermost_pseudo {
                 // Anonymous boxes should not have a tag, because they should not take part in hit testing.
@@ -250,7 +257,7 @@ impl From<ServoLayoutNode<'_>> for BaseFragmentInfo {
 bitflags! {
     /// Flags used to track various information about a DOM node during layout.
     #[derive(Clone, Copy, Debug)]
-    pub(crate) struct FragmentFlags: u16 {
+    pub(crate) struct FragmentFlags: u32 {
         /// Whether or not the node that created this fragment is a `<body>` element on an HTML document.
         const IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT = 1 << 0;
         /// Whether or not the node that created this Fragment is a `<br>` element, or a `::before`
@@ -299,6 +306,8 @@ bitflags! {
         /// `containertimingignore` attribute, so that it and its descendants do not
         /// contribute to any enclosing container root.
         const IS_CONTAINER_TIMING_IGNORE = 1 << 15;
+        /// Whether or not the node that created this fragment is in the MathML namespace.
+        const IS_MATHML_ELEMENT = 1 << 16;
     }
 }
 

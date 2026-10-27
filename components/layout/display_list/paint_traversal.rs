@@ -655,8 +655,13 @@ impl TraversalState {
             // In the following cases this box establishes its own containing block,
             // so use its tag:
             // - Non-inline box
+            // - MathML element
             // - Style establishes a containing block
             containing_element_tag: if !box_fragment.is_inline_box() ||
+                box_fragment
+                    .base
+                    .flags
+                    .contains(FragmentFlags::IS_MATHML_ELEMENT) ||
                 style.establishes_containing_block_for_absolute_descendants(
                     box_fragment.base.flags,
                 ) {

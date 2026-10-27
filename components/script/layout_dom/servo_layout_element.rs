@@ -250,6 +250,10 @@ impl<'dom> LayoutElement<'dom> for ServoLayoutElement<'dom> {
                 .is_html_document_for_layout()
     }
 
+    fn is_mathml_element(&self) -> bool {
+        *self.element.namespace() == ns!(mathml)
+    }
+
     fn is_root(&self) -> bool {
         self.element.is_root()
     }
