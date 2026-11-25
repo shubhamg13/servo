@@ -77,6 +77,8 @@ multiprocess = ["servo-base/multiprocess", "servo-constellation/multiprocess"]
 native-bluetooth = ["servo-bluetooth/native-bluetooth"]
 no-wgl = ["dep:mozangle", "mozangle/egl", "mozangle/build_dlls", "surfman/sm-angle-default", "paint_api/no-wgl"]
 profilemozjs = ["script/profilemozjs"]
+# Include the Snake game on the network error page.
+snake-game = ["baked-in-resources", "servo-default-resources?/snake-game"]
 testbinding = ["script/testbinding"]
 tracing = [
     "dep:tracing",

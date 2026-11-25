@@ -1,0 +1,20 @@
+[workspace]
+# This standalone crate is built for wasm32-unknown-unknown on demand; it is
+# not part of the main Servo workspace.
+
+[package]
+name = "snake-game"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+strip = true
+codegen-units = 1

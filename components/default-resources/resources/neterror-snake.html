@@ -1,0 +1,752 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Error loading page</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body { margin: 0; }
+    body {
+      min-height: 100vh;
+      padding: 16px;
+      padding-bottom: calc(16px + env(safe-area-inset-bottom));
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: #f6f7f9;
+      color: #1f2328;
+      -webkit-text-size-adjust: 100%;
+    }
+    main { max-width: 560px; margin: 0 auto; }
+    .error {
+      margin: 0 0 20px;
+      font-size: 1rem;
+      line-height: 1.5;
+      overflow-wrap: anywhere;
+    }
+    .error code {
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: rgba(0, 0, 0, 0.06);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .is-hidden { display: none !important; }
+    .launcher-wrap {
+      margin-top: 24px;
+      text-align: center;
+    }
+    #snake-launcher {
+      display: inline-block;
+      padding: 10px 14px;
+      border: 0;
+      border-radius: 16px;
+      background: transparent;
+      color: #57606a;
+      font-family: inherit;
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+    }
+    #snake-icon { display: block; width: 64px; height: 64px; margin: 0 auto; }
+    .play-hint {
+      display: block;
+      margin-top: 10px;
+      font-size: 0.9rem;
+      line-height: 1.3;
+    }
+    .launch-hint-touch { display: none; }
+    @media (hover: none), (pointer: coarse) {
+      .launch-hint-desktop { display: none; }
+      .launch-hint-touch { display: inline; }
+    }
+    body.touch .launch-hint-desktop { display: none; }
+    body.touch .launch-hint-touch { display: inline; }
+    #snake-launcher:hover #snake-icon { transform: scale(1.06); }
+    #snake-launcher:active #snake-icon { transform: scale(0.95); }
+    #snake-launcher:hover .play-hint { color: #1f2328; }
+    #snake-launcher:focus { outline: 2px solid #3b82f6; outline-offset: 4px; }
+    .game { margin-top: 8px; user-select: none; -webkit-user-select: none; }
+    .hud {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      margin-bottom: 8px;
+      font-size: 0.95rem;
+    }
+    .title { font-weight: 600; }
+    .score { color: #57606a; font-variant-numeric: tabular-nums; }
+    #snake-board {
+      display: block;
+      width: 100%;
+      height: auto;
+      background: #0b1220;
+      border-radius: 12px;
+      outline: none;
+      touch-action: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .hint {
+      min-height: 1.4em;
+      margin: 10px 0 0;
+      color: #57606a;
+      font-size: 0.9rem;
+      text-align: center;
+    }
+    .dpad {
+      display: none;
+      grid-template-columns: repeat(3, 56px);
+      grid-template-rows: repeat(2, 56px);
+      gap: 8px;
+      justify-content: center;
+      margin-top: 16px;
+    }
+    @media (hover: none), (pointer: coarse) {
+      .dpad { display: grid; }
+    }
+    body.touch .dpad { display: grid; }
+    .dpad button {
+      appearance: none;
+      padding: 0;
+      border: 1px solid #d0d7de;
+      border-radius: 10px;
+      background: #ffffff;
+      color: #1f2328;
+      font-size: 20px;
+      line-height: 1;
+      touch-action: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .dpad button:active { background: #eaeef2; }
+    .dpad .up { grid-column: 2; grid-row: 1; }
+    .dpad .left { grid-column: 1; grid-row: 2; }
+    .dpad .down { grid-column: 2; grid-row: 2; }
+    .dpad .right { grid-column: 3; grid-row: 2; }
+    #snake-morph {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      display: none;
+      pointer-events: none;
+      z-index: 10;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <p class="error">Could not load the requested page: <code>${reason}</code></p>
+
+    <div class="launcher-wrap" id="snake-launcher-wrap">
+      <button id="snake-launcher" type="button" aria-label="Play Snake">
+        <canvas id="snake-icon" width="128" height="128" aria-hidden="true"></canvas>
+        <span class="play-hint">
+          <span class="launch-hint-desktop">Press Space or click to play</span>
+          <span class="launch-hint-touch">Tap to play</span>
+        </span>
+      </button>
+    </div>
+
+    <section class="game is-hidden" id="snake-game" aria-labelledby="snake-title">
+      <div class="hud">
+        <span class="title" id="snake-title">Snake</span>
+        <span class="score">Score: <span id="snake-score" aria-live="polite">0</span></span>
+      </div>
+      <canvas id="snake-board" width="400" height="400"
+              aria-label="Snake game board" aria-describedby="snake-hint"></canvas>
+      <p class="hint" id="snake-hint" aria-live="polite">Swipe or press an arrow key to start</p>
+      <div class="dpad" id="snake-dpad" role="group" aria-label="Directional controls">
+        <button type="button" class="up" data-dir="0" aria-label="Up">&#9650;</button>
+        <button type="button" class="left" data-dir="3" aria-label="Left">&#9664;</button>
+        <button type="button" class="down" data-dir="2" aria-label="Down">&#9660;</button>
+        <button type="button" class="right" data-dir="1" aria-label="Right">&#9654;</button>
+      </div>
+    </section>
+  </main>
+
+  <canvas id="snake-morph" aria-hidden="true"></canvas>
+
+  <script>
+  "use strict";
+  (function () {
+    var B64 = "${snake}";
+    var W = 20;
+    var H = 20;
+    var ICON_SIZE = 64;
+    var LOGO = [
+      { color: "#42BE65", a0: -120, a1: -60 }, // top arc, becomes the head
+      { color: "#009D9A", a0: -48, a1: 12 },   // upper right
+      { color: "#1192E8", a0: 24, a1: 84 },    // lower right
+      { color: "#1192E8", a0: 96, a1: 156 },   // lower left
+      { color: "#009D9A", a0: 168, a1: 228 }   // upper left
+    ];
+    var SEGMENT_TARGET = [4, 3, 2, 1, 0];
+    var KEYS = {
+      ArrowUp: 0, ArrowRight: 1, ArrowDown: 2, ArrowLeft: 3,
+      w: 0, d: 1, s: 2, a: 3,
+      W: 0, D: 1, S: 2, A: 3
+    };
+
+    var LAUNCHER = document.getElementById("snake-launcher");
+    var WRAP = document.getElementById("snake-launcher-wrap");
+    var ICON = document.getElementById("snake-icon");
+    var GAME = document.getElementById("snake-game");
+    var BOARD = document.getElementById("snake-board");
+    var CTX = BOARD.getContext("2d");
+    var SCORE = document.getElementById("snake-score");
+    var HINT = document.getElementById("snake-hint");
+    var DPAD = document.getElementById("snake-dpad");
+    var MORPH = document.getElementById("snake-morph");
+    var MCTX = MORPH.getContext("2d");
+
+    var wasm = null;
+    var grid = null;
+    var loadPromise = null;
+    var started = false;
+    var over = false;
+    var won = false;
+    var lastTick = 0;
+    var tickMs = 140;
+    var swipe = null;
+    var touchShown = false;
+    var revealed = false;
+    var launching = false;
+
+    function load() {
+      if (loadPromise) {
+        return loadPromise;
+      }
+      loadPromise = Promise.resolve().then(function () {
+        if (B64.charAt(0) === "$") {
+          throw new Error("snake wasm was not embedded");
+        }
+        var bin = atob(B64);
+        var bytes = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) {
+          bytes[i] = bin.charCodeAt(i);
+        }
+        return WebAssembly.instantiate(bytes, {});
+      }).then(function (result) {
+        wasm = result.instance.exports;
+        grid = new Uint8Array(wasm.memory.buffer, wasm.snake_grid(), W * H);
+        return wasm;
+      }).catch(function (err) {
+        HINT.textContent = "Game unavailable.";
+        throw err;
+      });
+      return loadPromise;
+    }
+
+    function drawLogoArc(c, cx, cy, r, a0, a1, color) {
+      c.strokeStyle = color;
+      c.beginPath();
+      c.arc(cx, cy, r, a0 * Math.PI / 180, a1 * Math.PI / 180);
+      c.stroke();
+    }
+
+    function drawIcon() {
+      var dpr = Math.min(window.devicePixelRatio || 1, 2);
+      ICON.width = Math.max(1, Math.round(ICON_SIZE * dpr));
+      ICON.height = Math.max(1, Math.round(ICON_SIZE * dpr));
+      var c = ICON.getContext("2d");
+      c.setTransform(dpr, 0, 0, dpr, 0, 0);
+      c.clearRect(0, 0, ICON_SIZE, ICON_SIZE);
+      c.lineWidth = ICON_SIZE * 0.19;
+      c.lineCap = "butt";
+      var cx = ICON_SIZE / 2;
+      var cy = ICON_SIZE / 2;
+      var r = ICON_SIZE * 0.33;
+      for (var i = 0; i < LOGO.length; i++) {
+        drawLogoArc(c, cx, cy, r, LOGO[i].a0, LOGO[i].a1, LOGO[i].color);
+      }
+    }
+
+    function start(dir) {
+      load().then(function () {
+        var seed = (Date.now() ^ (Math.random() * 0xffffffff)) >>> 0;
+        wasm.snake_reset(seed, dir);
+        wasm.snake_set_dir(dir);
+        started = true;
+        over = false;
+        won = false;
+        tickMs = 140;
+        SCORE.textContent = "0";
+        HINT.textContent = "Swipe or use the arrow keys";
+        lastTick = performance.now();
+        draw();
+      }).catch(function () {});
+    }
+
+    function begin(dir) {
+      if (!wasm) {
+        return;
+      }
+      if (over) {
+        start(dir);
+        return;
+      }
+      if (started) {
+        return;
+      }
+      // Start from the preview state so the food stays where it was shown.
+      if (!wasm.snake_start(dir)) {
+        HINT.textContent = "Try another direction to start.";
+        return;
+      }
+      started = true;
+      tickMs = 140;
+      lastTick = performance.now();
+      HINT.textContent = "Swipe or use the arrow keys";
+      draw();
+    }
+
+    function applyDir(dir) {
+      if (!revealed || launching) {
+        return;
+      }
+      if (over) {
+        start(dir);
+      } else if (!started) {
+        begin(dir);
+      } else if (wasm) {
+        wasm.snake_set_dir(dir);
+      }
+    }
+
+    function tick() {
+      var result = wasm.snake_step();
+      if (result === 1) {
+        over = true;
+        HINT.textContent = "Game over. Swipe or press an arrow key to restart.";
+      } else if (result === 2) {
+        SCORE.textContent = String(wasm.snake_score());
+        if (!wasm.snake_alive()) {
+          over = true;
+          won = true;
+          HINT.textContent = "You win! Swipe or press an arrow key to restart.";
+        } else {
+          tickMs = Math.max(70, 140 - Math.floor(wasm.snake_score() / 3) * 10);
+        }
+      }
+      draw();
+    }
+
+    function frame(now) {
+      if (started && !over && wasm && now - lastTick >= tickMs) {
+        lastTick = now;
+        tick();
+      }
+      requestAnimationFrame(frame);
+    }
+
+    function resize() {
+      var rect = BOARD.getBoundingClientRect();
+      var width = Math.floor(rect.width);
+      if (width <= 0) {
+        return;
+      }
+      // Keep the board, hint, and (on touch) the d-pad inside the viewport.
+      var reserved = 16 + 10 + HINT.getBoundingClientRect().height;
+      if (getComputedStyle(DPAD).display !== "none") {
+        reserved += 16 + DPAD.getBoundingClientRect().height;
+      }
+      var available = Math.floor(window.innerHeight - rect.top - reserved);
+      var size = Math.max(160, Math.min(width, available));
+      BOARD.style.height = size + "px";
+      var dpr = Math.min(window.devicePixelRatio || 1, 2);
+      BOARD.width = Math.max(1, Math.round(size * dpr));
+      BOARD.height = Math.max(1, Math.round(size * dpr));
+      draw();
+    }
+
+    function fillCell(x, y, cw, ch, pad, color) {
+      CTX.fillStyle = color;
+      CTX.fillRect(x * cw + pad, y * ch + pad, cw - pad * 2, ch - pad * 2);
+    }
+
+    function draw() {
+      CTX.fillStyle = "#0b1220";
+      CTX.fillRect(0, 0, BOARD.width, BOARD.height);
+      if (!grid) {
+        return;
+      }
+      var cw = BOARD.width / W;
+      var ch = BOARD.height / H;
+      var pad = Math.max(1, Math.floor(Math.min(cw, ch) * 0.08));
+      for (var y = 0; y < H; y++) {
+        for (var x = 0; x < W; x++) {
+          var v = grid[y * W + x];
+          if (!v) {
+            continue;
+          }
+          fillCell(x, y, cw, ch, pad,
+                   v === 3 ? "#f59e0b" : v === 2 ? "#42BE65" : "#009D9A");
+        }
+      }
+    }
+
+    function markTouch() {
+      if (!touchShown) {
+        touchShown = true;
+        document.body.classList.add("touch");
+        if (revealed || launching) {
+          requestAnimationFrame(resize);
+        }
+      }
+    }
+
+    function previewCells() {
+      if (!grid) {
+        return [];
+      }
+      var head = -1;
+      for (var i = 0; i < grid.length; i++) {
+        if (grid[i] === 2) {
+          head = i;
+          break;
+        }
+      }
+      if (head < 0) {
+        return [];
+      }
+      var hx = head % W;
+      var hy = Math.floor(head / W);
+      var cells = [];
+      // The preview always uses direction 1, so the body extends left.
+      for (var n = 4; n >= 0; n--) {
+        var x = hx - n;
+        if (x < 0) {
+          break;
+        }
+        cells.push({ x: x, y: hy });
+      }
+      return cells;
+    }
+
+    function lerp(a, b, t) {
+      return a + (b - a) * t;
+    }
+
+    function sampleArc(cx, cy, r, a0, a1, n) {
+      var points = [];
+      var start = a0 * Math.PI / 180;
+      var end = a1 * Math.PI / 180;
+      for (var i = 0; i < n; i++) {
+        var a = start + (end - start) * (i / (n - 1));
+        points.push({ x: cx + Math.cos(a) * r, y: cy + Math.sin(a) * r });
+      }
+      return points;
+    }
+
+    function sampleLine(x0, y0, x1, y1, n) {
+      var points = [];
+      for (var i = 0; i < n; i++) {
+        var t = i / (n - 1);
+        points.push({ x: x0 + (x1 - x0) * t, y: y0 + (y1 - y0) * t });
+      }
+      return points;
+    }
+
+    function roundedRect(c, x, y, w, h, r) {
+      r = Math.max(0, Math.min(r, w / 2, h / 2));
+      c.beginPath();
+      c.moveTo(x + r, y);
+      c.lineTo(x + w - r, y);
+      c.arc(x + w - r, y + r, r, -Math.PI / 2, 0);
+      c.lineTo(x + w, y + h - r);
+      c.arc(x + w - r, y + h - r, r, 0, Math.PI / 2);
+      c.lineTo(x + r, y + h);
+      c.arc(x + r, y + h - r, r, Math.PI / 2, Math.PI);
+      c.lineTo(x, y + r);
+      c.arc(x + r, y + r, r, Math.PI, Math.PI * 1.5);
+      c.closePath();
+    }
+
+    function revealGame() {
+      GAME.style.visibility = "";
+      HINT.textContent = "Swipe or press an arrow key to start";
+      revealed = true;
+      launching = false;
+      draw();
+      resize();
+    }
+
+    function revealBoard() {
+      GAME.style.visibility = "";
+      draw();
+      resize();
+      var fadeStart = performance.now();
+      var fadeMs = 140;
+      function fade(now) {
+        var t = Math.min(1, (now - fadeStart) / fadeMs);
+        MORPH.style.opacity = String(1 - t);
+        if (t < 1) {
+          requestAnimationFrame(fade);
+        } else {
+          MORPH.style.display = "none";
+          MORPH.style.opacity = "1";
+          revealGame();
+        }
+      }
+      requestAnimationFrame(fade);
+    }
+
+    function startMorph(iconRect, boardRect, cells) {
+      var dpr = Math.min(window.devicePixelRatio || 1, 2);
+      var vw = window.innerWidth;
+      var vh = window.innerHeight;
+      MORPH.width = Math.max(1, Math.round(vw * dpr));
+      MORPH.height = Math.max(1, Math.round(vh * dpr));
+      MORPH.style.display = "block";
+      MORPH.style.opacity = "1";
+      MCTX.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      var cx0 = iconRect.left + iconRect.width / 2;
+      var cy0 = iconRect.top + iconRect.height / 2;
+      var r0 = iconRect.width * 0.33;
+      var lw0 = iconRect.width * 0.19;
+      var cellW = boardRect.width / W;
+      var cellH = boardRect.height / H;
+
+      var targets = [];
+      for (var i = 0; i < cells.length; i++) {
+        targets.push({
+          x: boardRect.left + (cells[i].x + 0.5) * cellW,
+          y: boardRect.top + (cells[i].y + 0.5) * cellH
+        });
+      }
+
+      var arcs = [];
+      var lines = [];
+      var half = cellW * 0.42;
+      for (var s = 0; s < LOGO.length; s++) {
+        arcs.push(sampleArc(cx0, cy0, r0, LOGO[s].a0, LOGO[s].a1, 28));
+        var target = targets[SEGMENT_TARGET[s]] || targets[targets.length - 1];
+        lines.push(sampleLine(target.x - half, target.y, target.x + half, target.y, 28));
+      }
+
+      var startRect = {
+        x: cx0 - iconRect.width / 2,
+        y: cy0 - iconRect.height / 2,
+        w: iconRect.width,
+        h: iconRect.height,
+        r: iconRect.width / 2
+      };
+      var endRect = {
+        x: boardRect.left,
+        y: boardRect.top,
+        w: boardRect.width,
+        h: boardRect.height,
+        r: 12
+      };
+      var cellStroke = Math.min(cellW, cellH) * 0.84;
+      var duration = 650;
+      var startTime = performance.now();
+
+      function morphFrame(now) {
+        var t = Math.min(1, (now - startTime) / duration);
+        var e = t * t * (3 - 2 * t);
+        MCTX.clearRect(0, 0, vw, vh);
+
+        var bgAlpha = Math.min(1, t * 1.8);
+        MCTX.globalAlpha = bgAlpha;
+        roundedRect(
+          MCTX,
+          lerp(startRect.x, endRect.x, e),
+          lerp(startRect.y, endRect.y, e),
+          lerp(startRect.w, endRect.w, e),
+          lerp(startRect.h, endRect.h, e),
+          lerp(startRect.r, endRect.r, e)
+        );
+        MCTX.fillStyle = "#0b1220";
+        MCTX.fill();
+        MCTX.globalAlpha = 1;
+
+        MCTX.lineJoin = "round";
+        MCTX.lineCap = "butt";
+        for (var s = 0; s < LOGO.length; s++) {
+          MCTX.beginPath();
+          for (var p = 0; p < arcs[s].length; p++) {
+            var x = lerp(arcs[s][p].x, lines[s][p].x, e);
+            var y = lerp(arcs[s][p].y, lines[s][p].y, e);
+            if (p === 0) {
+              MCTX.moveTo(x, y);
+            } else {
+              MCTX.lineTo(x, y);
+            }
+          }
+          MCTX.lineWidth = lerp(lw0, cellStroke, e);
+          MCTX.strokeStyle = LOGO[s].color;
+          MCTX.stroke();
+        }
+
+        if (t < 1) {
+          requestAnimationFrame(morphFrame);
+        } else {
+          revealBoard();
+        }
+      }
+      requestAnimationFrame(morphFrame);
+    }
+
+    function launch() {
+      if (launching || revealed) {
+        return;
+      }
+      launching = true;
+      LAUNCHER.disabled = true;
+      var iconRect = ICON.getBoundingClientRect();
+      var reduce = false;
+      try {
+        reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      } catch (e) {}
+
+      load().then(function () {
+        var seed = (Date.now() ^ (Math.random() * 0xffffffff)) >>> 0;
+        wasm.snake_reset(seed, 1);
+        SCORE.textContent = "0";
+        HINT.textContent = "Swipe or press an arrow key to start";
+        LAUNCHER.classList.add("is-hidden");
+        WRAP.classList.add("is-hidden");
+        GAME.classList.remove("is-hidden");
+        GAME.style.visibility = "hidden";
+        resize();
+        var boardRect = BOARD.getBoundingClientRect();
+        var cells = previewCells();
+        if (reduce || !boardRect.width || !cells.length) {
+          revealGame();
+          return;
+        }
+        startMorph(iconRect, boardRect, cells);
+      }).catch(function () {
+        LAUNCHER.classList.add("is-hidden");
+        WRAP.classList.add("is-hidden");
+        GAME.classList.remove("is-hidden");
+        GAME.style.visibility = "";
+        HINT.textContent = "Game unavailable.";
+        revealed = true;
+        launching = false;
+        resize();
+      });
+    }
+
+    document.addEventListener("keydown", function (e) {
+      if (!revealed) {
+        if (e.key === " " || e.key === "Spacebar" || e.key === "Enter") {
+          e.preventDefault();
+          launch();
+        }
+        return;
+      }
+      if (e.key === " " || e.key === "Spacebar") {
+        e.preventDefault();
+        begin(1);
+        return;
+      }
+      var dir = KEYS[e.key];
+      if (dir === undefined) {
+        return;
+      }
+      e.preventDefault();
+      applyDir(dir);
+    }, { passive: false });
+
+    LAUNCHER.addEventListener("pointerdown", function (e) {
+      if (e.pointerType === "touch" || e.pointerType === "pen") {
+        markTouch();
+      }
+      load().catch(function () {});
+    }, { passive: true });
+    LAUNCHER.addEventListener("focus", function () {
+      load().catch(function () {});
+    });
+    LAUNCHER.addEventListener("click", launch);
+
+    BOARD.addEventListener("pointerdown", function (e) {
+      if (e.pointerType === "touch" || e.pointerType === "pen") {
+        markTouch();
+      }
+      swipe = { id: e.pointerId, x: e.clientX, y: e.clientY };
+    }, { passive: true });
+
+    window.addEventListener("pointerup", function (e) {
+      if (!swipe || e.pointerId !== swipe.id) {
+        return;
+      }
+      var dx = e.clientX - swipe.x;
+      var dy = e.clientY - swipe.y;
+      swipe = null;
+      if (!revealed || launching) {
+        return;
+      }
+      if (Math.abs(dx) < 18 && Math.abs(dy) < 18) {
+        begin(1);
+        return;
+      }
+      applyDir(Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 1 : 3) : (dy > 0 ? 2 : 0));
+    }, { passive: true });
+
+    window.addEventListener("pointercancel", function (e) {
+      if (swipe && e.pointerId === swipe.id) {
+        swipe = null;
+      }
+    }, { passive: true });
+
+    DPAD.addEventListener("pointerdown", function (e) {
+      var btn = e.target;
+      if (!btn || btn.tagName !== "BUTTON") {
+        return;
+      }
+      var dir = Number(btn.getAttribute("data-dir"));
+      if (isNaN(dir)) {
+        return;
+      }
+      e.preventDefault();
+      markTouch();
+      applyDir(dir);
+    });
+
+    document.addEventListener("visibilitychange", function () {
+      if (document.visibilityState === "visible") {
+        lastTick = performance.now();
+      }
+    });
+
+    window.addEventListener("resize", function () {
+      drawIcon();
+      if (revealed || launching) {
+        resize();
+      }
+    });
+    window.addEventListener("orientationchange", function () {
+      if (revealed || launching) {
+        resize();
+      }
+    });
+
+    drawIcon();
+    requestAnimationFrame(frame);
+
+    // Debug hook used by the automated tests.
+    window.__snake = {
+      start: start,
+      setDir: applyDir,
+      launch: launch,
+      grid: function () {
+        return grid ? Array.prototype.slice.call(grid) : null;
+      },
+      state: function () {
+        return {
+          revealed: revealed,
+          started: started,
+          over: over,
+          won: won,
+          score: wasm ? wasm.snake_score() : 0,
+          len: wasm ? wasm.snake_len() : 0,
+          dir: wasm ? wasm.snake_next_dir() : -1,
+          alive: wasm ? !!wasm.snake_alive() : false
+        };
+      }
+    };
+  })();
+  </script>
+</body>
+</html>

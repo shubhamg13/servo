@@ -12,7 +12,12 @@ rust-version.workspace = true
 [lib]
 path = "lib.rs"
 
+[features]
+# Include the Snake game on the network error page.
+snake-game = ["dep:base64"]
+
 [dependencies]
+base64 = { workspace = true, optional = true }
 embedder_traits = { workspace = true }
 
 [lints]
